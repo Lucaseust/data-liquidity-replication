@@ -358,7 +358,13 @@ make_prevalent_use_case_controls <- function(df, min_share = 0.02) {
     uc_cols <- setdiff(uc_cols, duplicate_cols)
   }
 
-  safe_names <- make.unique(make.names(uc_cols))
+  # Formula-safe names must also be portable across operating-system locales.
+  # Keep the original tags for selection and ordering, but transliterate the
+  # generated column identifiers to ASCII before calling make.names().
+  ascii_cols <- iconv(enc2utf8(uc_cols), from = "UTF-8", to = "ASCII//TRANSLIT", sub = "_")
+  invalid_ascii <- is.na(ascii_cols) | !nzchar(ascii_cols)
+  ascii_cols[invalid_ascii] <- paste0("uc_", which(invalid_ascii))
+  safe_names <- make.unique(make.names(ascii_cols, allow_ = TRUE))
   names(out)[match(uc_cols, names(out))] <- safe_names
 
   list(

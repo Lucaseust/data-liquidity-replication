@@ -79,5 +79,5 @@ enter jointly as nuisance controls for intended application. Tags below the
 threshold are not pooled into an `other` category. Tags are sorted alphabetically
 before duplicate profiles are checked; if profiles coincided, the first tag would
 be kept and later identical profiles removed. Names are then converted to unique,
-valid R identifiers. Sensitivity checks repeat the estimation at thresholds
+valid, ASCII-compatible R identifiers. Sensitivity checks repeat the estimation at thresholds
 from 1% to 5% and without use-case controls.
