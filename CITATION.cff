@@ -1,9 +1,9 @@
 cff-version: 1.2.0
-message: "If you use these replication materials, please cite the associated paper."
-title: "Intrinsic Data Liquidity Replication Materials"
+message: "If you use these replication materials, please cite the associated chapter."
+title: "Data Liquidity and Market Replication Materials"
 authors:
   - family-names: "Eustache"
     given-names: "Lucas"
-repository-code: "https://github.com/lucaseust/intrinsic-data-liquidity-replication"
-date-released: "2026-04-25"
+repository-code: "https://github.com/Lucaseust/data-liquidity-replication"
+date-released: "2026-08-08"
 license: "MIT"
