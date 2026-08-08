@@ -37,7 +37,9 @@ found, so all 62 indicators enter jointly as nuisance controls for intended
 application. Rare tags are not pooled into an `other` category. Retained tags
 are sorted alphabetically before duplicate profiles are checked; if profiles
 coincided, the first tag would be kept and later identical profiles removed.
-Column names are then converted to unique, syntactically valid, ASCII-compatible R identifiers. Sensitivity checks vary the threshold
+Regression columns receive stable, sequential ASCII identifiers (`uc_001`,
+etc.), and the returned `tag_map` preserves their correspondence with the
+original tags. Sensitivity checks vary the threshold
 from 1% to 5% and omit the controls entirely.
 
 ## Productization robustness variables

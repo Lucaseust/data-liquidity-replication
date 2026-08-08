@@ -358,13 +358,15 @@ make_prevalent_use_case_controls <- function(df, min_share = 0.02) {
     uc_cols <- setdiff(uc_cols, duplicate_cols)
   }
 
-  # Formula-safe names must also be portable across operating-system locales.
-  # Keep the original tags for selection and ordering, but transliterate the
-  # generated column identifiers to ASCII before calling make.names().
-  ascii_cols <- iconv(enc2utf8(uc_cols), from = "UTF-8", to = "ASCII//TRANSLIT", sub = "_")
-  invalid_ascii <- is.na(ascii_cols) | !nzchar(ascii_cols)
-  ascii_cols[invalid_ascii] <- paste0("uc_", which(invalid_ascii))
-  safe_names <- make.unique(make.names(ascii_cols, allow_ = TRUE))
+  # Formula-safe names must be portable across operating-system locales. The
+  # original, alphabetically ordered tags remain available in `tag_map`, while
+  # regression columns use deterministic sequential ASCII identifiers.
+  safe_names <- sprintf("uc_%03d", seq_along(uc_cols))
+  tag_map <- data.frame(
+    source_tag = sub("^uc_", "", uc_cols),
+    column = safe_names,
+    stringsAsFactors = FALSE
+  )
   names(out)[match(uc_cols, names(out))] <- safe_names
 
   list(
@@ -373,7 +375,8 @@ make_prevalent_use_case_controls <- function(df, min_share = 0.02) {
     min_share = min_share,
     min_n = min_n,
     retained_tags = nrow(retained),
-    duplicate_profiles_removed = sub("^uc_", "", duplicate_cols)
+    duplicate_profiles_removed = sub("^uc_", "", duplicate_cols),
+    tag_map = tag_map
   )
 }
 
