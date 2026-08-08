@@ -74,5 +74,8 @@ the 4,525-listing estimation sample (at least 91 listings). Exact duplicate
 indicator profiles are removed deterministically before estimation, without
 consulting either the data-liquidity index or the outcome. The resulting 62
 indicators enter jointly as nuisance controls for intended application. Tags
-below the threshold are not pooled into an `other` category. Sensitivity checks
-repeat the estimation at thresholds from 1% to 5% and without use-case controls.
+below the threshold are not pooled into an `other` category. Tags are sorted
+alphabetically before duplicate profiles are checked, so the first tag is kept
+and later identical profiles are removed; names are then converted to unique,
+valid R identifiers. Sensitivity checks repeat the estimation at thresholds
+from 1% to 5% and without use-case controls.

@@ -33,9 +33,11 @@ retains tags appearing on at least 2% of the provider-identified estimation
 sample (at least 91 of 4,525 listings). Exact duplicate indicator profiles are
 removed deterministically without consulting the outcome or data-liquidity
 index. The resulting 62 indicators enter jointly as nuisance controls for
-intended application. Rare tags are not pooled into an `other` category.
-Sensitivity checks vary the threshold from 1% to 5% and omit the controls
-entirely.
+intended application. Rare tags are not pooled into an `other` category. Retained tags are sorted
+alphabetically before duplicate profiles are checked, so the first tag is kept
+and later identical profiles are removed. Column names are then converted to
+unique, syntactically valid R identifiers. Sensitivity checks vary the threshold
+from 1% to 5% and omit the controls entirely.
 
 ## Productization robustness variables
 
