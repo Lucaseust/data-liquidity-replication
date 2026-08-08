@@ -12,6 +12,10 @@ marketplace listings from 407 identified Datarade providers.
 | `extract_results.R` | Standalone script that prints regression results and diagnostics to the console. |
 | `extract_fsqca.R` | Standalone script that prints fsQCA calibration, necessity, sufficiency, and truth-table results. |
 | `robustness_extra.R` | Productization-intensity and missing-rating robustness checks reported in the chapter. |
+| `reproduce.R` | One-command execution of regressions, robustness checks, fsQCA, and the rendered report. |
+| `install_packages.R` | Installs the R package dependencies used by the replication workflow. |
+| `DATA_DICTIONARY.md` | Definitions and operationalization notes for analysis variables. |
+| `DATA_AVAILABILITY.md` | Redistribution and access note for the listing-level data. |
 
 ## Data
 
