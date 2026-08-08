@@ -9,7 +9,6 @@ suppressPackageStartupMessages({
   library(MASS); library(sandwich)
 })
 `%||%` <- function(a,b) if(is.null(a)||length(a)==0) b else a
-setwd("c:/Users/lucas/OneDrive/manuscrit/ch2/analysis")
 source("datarade_helpers.R")
 
 data_path <- if (file.exists("updated_datarade_data_scored_copy.jsonl")) {
