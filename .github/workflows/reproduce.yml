@@ -34,6 +34,7 @@ jobs:
             libtiff-dev \
             libjpeg-dev \
             libicu-dev \
+            libuv1-dev \
             libglpk-dev
 
       - name: Install R packages
