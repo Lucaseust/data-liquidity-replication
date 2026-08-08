@@ -14,8 +14,6 @@ required_packages <- c(
   "knitr"
 )
 
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-
 installed <- rownames(installed.packages())
 missing <- setdiff(required_packages, installed)
 
