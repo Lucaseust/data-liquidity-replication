@@ -5,19 +5,30 @@ required_packages <- c(
   "stringr",
   "ggplot2",
   "scales",
-  "fixest",
   "QCA",
   "kableExtra",
   "MASS",
+  "sandwich",
+  "clubSandwich",
   "rmarkdown",
   "knitr"
 )
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
 
 installed <- rownames(installed.packages())
 missing <- setdiff(required_packages, installed)
 
 if (length(missing) > 0) {
-  install.packages(missing, repos = "https://cloud.r-project.org")
+  install.packages(missing)
+}
+
+still_missing <- setdiff(required_packages, rownames(installed.packages()))
+if (length(still_missing) > 0) {
+  stop(
+    "Package installation incomplete: ",
+    paste(still_missing, collapse = ", ")
+  )
 }
 
 cat("Package check complete.\n")
