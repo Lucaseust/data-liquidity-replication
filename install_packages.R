@@ -3,6 +3,7 @@ required_packages <- c(
   "dplyr",
   "tidyr",
   "stringr",
+  "readr",
   "ggplot2",
   "scales",
   "QCA",
