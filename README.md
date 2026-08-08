@@ -70,12 +70,13 @@ The marketplace use-case field is multilabel: one listing can carry several
 tags. `make_prevalent_use_case_controls()` trims whitespace, converts tags to
 lower case, removes empty values, and expands every retained tag into a binary
 listing-level indicator. The baseline retains tags observed on at least 2% of
-the 4,525-listing estimation sample (at least 91 listings). Exact duplicate
-indicator profiles are removed deterministically before estimation, without
-consulting either the data-liquidity index or the outcome. The resulting 62
-indicators enter jointly as nuisance controls for intended application. Tags
-below the threshold are not pooled into an `other` category. Tags are sorted
-alphabetically before duplicate profiles are checked, so the first tag is kept
-and later identical profiles are removed; names are then converted to unique,
+the 4,525-listing estimation sample (at least 91 listings). The code checks for
+exact duplicate indicator profiles before estimation, without consulting either
+the data-liquidity index or the outcome. In the baseline sample, 62 tags pass
+the prevalence threshold and no duplicate profile is found, so all 62 indicators
+enter jointly as nuisance controls for intended application. Tags below the
+threshold are not pooled into an `other` category. Tags are sorted alphabetically
+before duplicate profiles are checked; if profiles coincided, the first tag would
+be kept and later identical profiles removed. Names are then converted to unique,
 valid R identifiers. Sensitivity checks repeat the estimation at thresholds
 from 1% to 5% and without use-case controls.
