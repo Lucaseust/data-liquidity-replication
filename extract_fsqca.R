@@ -1,20 +1,31 @@
 library(jsonlite)
 library(dplyr)
 library(tidyr)
+library(stringr)
 library(QCA)
+library(MASS)
+library(sandwich)
+library(clubSandwich)
 
 # ── Load (same logic as Rmd) ──
 source("datarade_helpers.R")
 
-data_path <- file.path("data", "updated_datarade_data_scored_copy.jsonl")
-if (!file.exists(data_path)) data_path <- "updated_datarade_data_scored_copy.jsonl"
-if (!file.exists(data_path)) stop("Data file not found: updated_datarade_data_scored_copy.jsonl")
-
+data_path <- if (file.exists("updated_datarade_data_scored_copy.jsonl")) {
+  "updated_datarade_data_scored_copy.jsonl"
+} else {
+  file.path("data", "updated_datarade_data_scored_copy.jsonl")
+}
 lines <- readLines(data_path, warn = FALSE)
 raw   <- lapply(lines, function(l) tryCatch(fromJSON(l), error = function(e) NULL))
 raw   <- raw[!sapply(raw, is.null)]
 urls  <- sapply(raw, function(r) r[["url"]] %||% NA_character_)
 raw   <- raw[!duplicated(urls)]
+provider_ids <- sapply(raw, function(r) {
+  v <- r[["provider_url"]]
+  if (is.null(v) || length(v) == 0) NA_character_ else as.character(v[1])
+})
+raw <- raw[!is.na(provider_ids) & nzchar(provider_ids)]
+urls <- sapply(raw, function(r) r[["url"]] %||% NA_character_)
 
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
 
@@ -151,98 +162,72 @@ if (!is.null(sol_new)) print(sol_new)
 
 # ── OLS and Ordered Logit (for main spec table) ──
 cat("\n=== OLS Regression ===\n")
-library(fixest)
-
-# Build use-case dummies using the same logic as ch2_empirical_report.Rmd.
-uc_long <- df %>%
-  mutate(row = row_number()) %>%
-  unnest(use_cases) %>%
-  mutate(use_cases = str_to_lower(str_squish(use_cases))) %>%
-  filter(nzchar(use_cases))
-
-uc_freq <- uc_long %>% count(use_cases) %>% filter(n >= 2)
-
-uc_wide <- uc_long %>%
-  filter(use_cases %in% uc_freq[["use_cases"]]) %>%
-  mutate(v = 1L) %>%
-  pivot_wider(
-    id_cols = row,
-    names_from = use_cases,
-    values_from = v,
-    values_fill = 0L,
-    names_prefix = "uc_"
-  )
-
-df <- df %>%
-  mutate(row = row_number()) %>%
-  left_join(uc_wide, by = "row")
-df$row <- NULL
-
-uc_cols <- grep("^uc_", names(df), value = TRUE)
-df <- df %>% mutate(across(all_of(uc_cols), ~replace_na(., 0L)))
-
-uc_keep <- make.names(uc_cols)
-names(df)[names(df) %in% uc_cols] <- uc_keep
-
-cat(sprintf("Use-case controls: %d retained from %d cleaned labels\n",
-            length(uc_keep), n_distinct(uc_long$use_cases)))
+# Build parsimonious use-case controls (tags present in at least 2% of listings).
+uc_design <- make_prevalent_use_case_controls(df, min_share = 0.02)
+df <- uc_design$data
+uc_keep <- uc_design$columns
 
 fml <- as.formula(paste("liquidity_count ~ IDL_std + provider_n + provider_rating + rating_missing +",
                         paste(uc_keep, collapse = " + ")))
 
 # Main Poisson
 cat("\n=== Main Poisson PML ===\n")
-m_pois <- fepois(fml, data = df, vcov = "hetero")
-ct_pois <- coeftable(m_pois)
+m_pois <- glm(fml, data = df, family = poisson(link = "log"))
+ct_pois <- cluster_coeftable(m_pois, df$provider_url)
 cat("Coeftable columns:", paste(colnames(ct_pois), collapse=", "), "\n")
 p_col <- ncol(ct_pois)  # last column is p-value
 cat(sprintf("Poisson: b=%.4f, se=%.4f, IRR=%.4f, p=%.6f\n",
-            coef(m_pois)["IDL_std"], sqrt(vcov(m_pois)["IDL_std","IDL_std"]),
+            coef(m_pois)["IDL_std"], ct_pois["IDL_std","Std. Error"],
             exp(coef(m_pois)["IDL_std"]), ct_pois["IDL_std", p_col]))
-ci <- confint(m_pois)["IDL_std",]
+ci <- cluster_confint(ct_pois)["IDL_std",]
 cat(sprintf("95%% CI for IRR: [%.4f, %.4f]\n", exp(ci[1]), exp(ci[2])))
-cat(sprintf("Pseudo R2: %.4f\n", r2(m_pois, "pr2")))
+null_pois <- glm(liquidity_count ~ 1, data = df, family = poisson(link = "log"))
+cat(sprintf("Pseudo R2: %.4f\n", 1 - as.numeric(logLik(m_pois)) / as.numeric(logLik(null_pois))))
 
 # Disaggregated Poisson
 cat("\n=== Disaggregated Poisson ===\n")
 fml_dis <- as.formula(paste("liquidity_count ~ C_score + T_rank + K_log + provider_n + provider_rating + rating_missing +",
                             paste(uc_keep, collapse = " + ")))
-m_dis <- fepois(fml_dis, data = df, vcov = "hetero")
-ct_dis <- coeftable(m_dis)
+m_dis <- glm(fml_dis, data = df, family = poisson(link = "log"))
+ct_dis <- cluster_coeftable(m_dis, df$provider_url)
 p_col <- ncol(ct_dis)
 for (v in c("C_score", "T_rank", "K_log")) {
   cat(sprintf("  %s: b=%.4f, se=%.4f, IRR=%.4f, p=%.6f\n", v,
-              coef(m_dis)[v], sqrt(vcov(m_dis)[v,v]),
+              coef(m_dis)[v], ct_dis[v,"Std. Error"],
               exp(coef(m_dis)[v]), ct_dis[v, p_col]))
 }
 
-m_ols <- feols(fml, data = df, vcov = "hetero")
+m_ols <- lm(fml, data = df)
+ct_ols <- cluster_coeftable(m_ols, df$provider_url)
 cat(sprintf("OLS: b=%.4f, se=%.4f, p=%.6f\n", coef(m_ols)["IDL_std"],
-            sqrt(vcov(m_ols)["IDL_std","IDL_std"]),
-            coeftable(m_ols)["IDL_std", "Pr(>|t|)"]))
+            ct_ols["IDL_std","Std. Error"], ct_ols["IDL_std", "Pr(>|t|)"]))
 
 cat("\n=== Ordered Logit ===\n")
 library(MASS)
 df$Y_ord <- factor(df$liquidity_count, ordered = TRUE)
 m_ologit <- polr(Y_ord ~ IDL_std + provider_n + provider_rating + rating_missing,
                  data = df, Hess = TRUE, method = "logistic")
-sm <- summary(m_ologit)
-b_ol <- sm$coefficients["IDL_std", "Value"]
-se_ol <- sm$coefficients["IDL_std", "Std. Error"]
-t_ol <- sm$coefficients["IDL_std", "t value"]
-p_ol <- 2 * pnorm(abs(t_ol), lower.tail = FALSE)
+ct_ol <- cluster_coeftable(m_ologit, df$provider_url)
+b_ol <- ct_ol["IDL_std", "Estimate"]
+se_ol <- ct_ol["IDL_std", "Std. Error"]
+p_ol <- ct_ol["IDL_std", "Pr(>|t|)"]
 cat(sprintf("OLogit: b=%.4f, se=%.4f, p=%.6f, OR=%.4f\n", b_ol, se_ol, p_ol, exp(b_ol)))
 
 # Provider FE Poisson
 cat("\n=== Provider FE Poisson ===\n")
-fml_fe <- liquidity_count ~ IDL_std + provider_n + provider_rating + rating_missing | provider_url
-m_fe <- tryCatch(fepois(fml_fe, data = df, vcov = "hetero"), error = function(e) NULL)
+df_fe <- df %>% group_by(provider_url) %>% filter(n() > 1, sum(liquidity_count) > 0) %>% ungroup()
+fml_fe <- as.formula(paste("liquidity_count ~ IDL_std +",
+                           paste(uc_keep, collapse = " + "), "+ factor(provider_url)"))
+m_fe <- tryCatch(glm(fml_fe, data = df_fe, family = poisson(link = "log")), error = function(e) NULL)
 if (!is.null(m_fe)) {
-  ct_fe <- coeftable(m_fe)
+  ct_fe <- cluster_coeftable(m_fe, df_fe$provider_url)
   p_col_fe <- ncol(ct_fe)
   cat(sprintf("FE Poisson: b=%.4f, se=%.4f, IRR=%.4f, p=%.6f\n",
-              coef(m_fe)["IDL_std"], sqrt(vcov(m_fe)["IDL_std","IDL_std"]),
+              coef(m_fe)["IDL_std"], ct_fe["IDL_std","Std. Error"],
               exp(coef(m_fe)["IDL_std"]), ct_fe["IDL_std", p_col_fe]))
+  cr2 <- clubSandwich::coef_test(m_fe, vcov = "CR2", cluster = df_fe$provider_url,
+                                 test = "Satterthwaite")
+  print(cr2[rownames(cr2) == "IDL_std", ])
 }
 
 # Quintile model
@@ -251,9 +236,9 @@ df$IDL_Q <- cut(df$IDL_std, breaks = quantile(df$IDL_std, probs = 0:5/5),
                 include.lowest = TRUE, labels = paste0("Q", 1:5))
 fml_q <- as.formula(paste("liquidity_count ~ IDL_Q + provider_n + provider_rating + rating_missing +",
                           paste(uc_keep, collapse = " + ")))
-m_q <- fepois(fml_q, data = df, vcov = "hetero")
+m_q <- glm(fml_q, data = df, family = poisson(link = "log"))
 cat("Quintile IRRs:\n")
-ct_q <- coeftable(m_q)
+ct_q <- cluster_coeftable(m_q, df$provider_url)
 p_col_q <- ncol(ct_q)
 for (q in paste0("IDL_QQ", 2:5)) {
   cat(sprintf("  %s: b=%.4f, IRR=%.4f, p=%.6f\n", q,

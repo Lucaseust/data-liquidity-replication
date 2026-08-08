@@ -308,3 +308,96 @@ normalize_binary_col <- function(x) {
   out[is.na(out) & vals %in% c("false", "f", "no", "n")] <- 0L
   out
 }
+
+# ---- Study 2 inference helpers ----
+
+# Build a parsimonious multilabel use-case control set. Tags must occur in at
+# least `min_share` of the provider-identified estimation sample. Exact duplicate
+# indicator profiles (for example, synonymous tags always assigned together)
+# are removed deterministically before estimation.
+make_prevalent_use_case_controls <- function(df, min_share = 0.02) {
+  stopifnot("use_cases" %in% names(df), min_share > 0, min_share < 1)
+
+  min_n <- ceiling(min_share * nrow(df))
+  uc_long <- df |>
+    dplyr::mutate(.uc_row = dplyr::row_number()) |>
+    tidyr::unnest(use_cases) |>
+    dplyr::mutate(use_cases = stringr::str_to_lower(stringr::str_squish(use_cases))) |>
+    dplyr::filter(nzchar(use_cases))
+
+  retained <- uc_long |>
+    dplyr::count(use_cases) |>
+    dplyr::filter(n >= min_n) |>
+    dplyr::arrange(use_cases)
+
+  uc_wide <- uc_long |>
+    dplyr::filter(use_cases %in% retained$use_cases) |>
+    dplyr::mutate(value = 1L) |>
+    tidyr::pivot_wider(
+      id_cols = .uc_row,
+      names_from = use_cases,
+      values_from = value,
+      values_fill = 0L,
+      names_prefix = "uc_"
+    )
+
+  out <- df |>
+    dplyr::mutate(.uc_row = dplyr::row_number()) |>
+    dplyr::left_join(uc_wide, by = ".uc_row") |>
+    dplyr::select(-.uc_row)
+
+  uc_cols <- grep("^uc_", names(out), value = TRUE)
+  out <- out |>
+    dplyr::mutate(dplyr::across(dplyr::all_of(uc_cols), ~tidyr::replace_na(., 0L)))
+
+  # Remove exact duplicate columns without consulting either IDL or the outcome.
+  profiles <- vapply(uc_cols, function(v) paste0(out[[v]], collapse = ""), character(1))
+  duplicate_cols <- uc_cols[duplicated(profiles)]
+  if (length(duplicate_cols)) {
+    out <- out |> dplyr::select(-dplyr::all_of(duplicate_cols))
+    uc_cols <- setdiff(uc_cols, duplicate_cols)
+  }
+
+  safe_names <- make.unique(make.names(uc_cols))
+  names(out)[match(uc_cols, names(out))] <- safe_names
+
+  list(
+    data = out,
+    columns = safe_names,
+    min_share = min_share,
+    min_n = min_n,
+    retained_tags = nrow(retained),
+    duplicate_profiles_removed = sub("^uc_", "", duplicate_cols)
+  )
+}
+
+# Provider-clustered sandwich inference with the finite-cluster multiplier and
+# t reference distribution using G - 1 degrees of freedom.
+cluster_coeftable <- function(model, cluster, type = "HC1") {
+  cluster <- as.character(cluster)
+  vc <- sandwich::vcovCL(model, cluster = cluster, type = type, cadjust = TRUE)
+  # vcovCL omits aliased coefficients; align estimates to its estimable rows.
+  estimates <- stats::coef(model)[rownames(vc)]
+  se <- sqrt(diag(vc))
+  statistic <- estimates / se
+  clusters <- length(unique(cluster[!is.na(cluster)]))
+  df <- clusters - 1L
+  p <- 2 * stats::pt(-abs(statistic), df = df)
+  out <- cbind(
+    Estimate = estimates,
+    `Std. Error` = se,
+    `t value` = statistic,
+    `Pr(>|t|)` = p
+  )
+  attr(out, "vcov") <- vc
+  attr(out, "cluster_df") <- df
+  out
+}
+
+cluster_confint <- function(coeftable, level = 0.95) {
+  critical <- stats::qt(1 - (1 - level) / 2, df = attr(coeftable, "cluster_df"))
+  cbind(
+    lower = coeftable[, "Estimate"] - critical * coeftable[, "Std. Error"],
+    upper = coeftable[, "Estimate"] + critical * coeftable[, "Std. Error"]
+  )
+}

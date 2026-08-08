@@ -1,5 +1,5 @@
 ---
-title: "Intrinsic Data Liquidity and Realized Liquidity: Empirical Report"
+title: "Data Liquidity and Market-Exchange Signals: Empirical Report"
 subtitle: "Main Specification (Poisson) + Configurational Robustness (fsQCA)"
 author: ""
 date: "`r Sys.Date()`"
@@ -34,7 +34,8 @@ suppressPackageStartupMessages({
   library(stringr)
   library(ggplot2)
   library(scales)
-  library(fixest)
+  library(sandwich)
+  library(clubSandwich)
   library(QCA)
   library(kableExtra)
 })
@@ -57,10 +58,11 @@ theme_set(
 ```{r load-data}
 source("datarade_helpers.R")
 
-data_path <- file.path("data", "updated_datarade_data_scored_copy.jsonl")
-if (!file.exists(data_path)) data_path <- "updated_datarade_data_scored_copy.jsonl"
-if (!file.exists(data_path)) stop("Data file not found: updated_datarade_data_scored_copy.jsonl")
-
+data_path <- if (file.exists("updated_datarade_data_scored_copy.jsonl")) {
+  "updated_datarade_data_scored_copy.jsonl"
+} else {
+  file.path("data", "updated_datarade_data_scored_copy.jsonl")
+}
 lines <- readLines(data_path, warn = FALSE)
 raw   <- lapply(lines, function(l) tryCatch(fromJSON(l), error = function(e) NULL))
 raw   <- raw[!sapply(raw, is.null)]
@@ -103,12 +105,17 @@ df <- tibble(
     as.character(unlist(uc))
   })
 )
+
+# Provider identifiers define the clustering level. Listings without one cannot
+# contribute to provider-clustered inference and are excluded before variables
+# are standardized or provider-level controls are constructed.
+df <- df %>% filter(!is.na(provider_url), nzchar(provider_url))
 ```
 
 ## Variable Construction
 
 Semantic clarity is measured by the **continuous classifier score** ($C_i^{\text{score}} \in [0.25,\,0.77]$)
-produced by the LLM-based semantic classifier (Gabriel).  This score reflects the
+produced by the LLM-based semantic classifier (GABRIEL).  This score reflects the
 probability that a listing's content qualifies as semantically clear under the
 ostension/transformation/contamination decision rules.  We also retain the binary
 prediction ($C_i^{\text{pred}} \in \{0,1\}$, threshold $\approx 0.52$) for
@@ -146,28 +153,14 @@ df <- left_join(df, prov_n, by = "provider_url") %>%
     provider_rating = replace_na(provider_rating, 0)
   )
 
-# Use-case dummies (â‰¥2 occurrences)
-uc_long <- df %>%
-  mutate(row = row_number()) %>%
-  unnest(use_cases) %>%
-  mutate(use_cases = str_to_lower(str_squish(use_cases))) %>%
-  filter(nzchar(use_cases))
-uc_freq <- uc_long %>% count(use_cases) %>% filter(n >= 2)
-uc_wide <- uc_long %>%
-  filter(use_cases %in% uc_freq$use_cases) %>%
-  mutate(v = 1L) %>%
-  pivot_wider(id_cols = row, names_from = use_cases, values_from = v,
-              values_fill = 0L, names_prefix = "uc_")
-df <- df %>% mutate(row = row_number()) %>%
-  left_join(uc_wide, by = "row") %>%
-  dplyr::select(-row)
-uc_cols <- grep("^uc_", names(df), value = TRUE)
-df <- df %>% mutate(across(all_of(uc_cols), ~replace_na(., 0L)))
-
-# Sanitise use-case column names: replace spaces/special chars with underscores
-safe_names <- make.names(uc_cols)
-names(df)[names(df) %in% uc_cols] <- safe_names
-uc_cols <- safe_names
+# Parsimonious multilabel use-case controls: retain tags present in at least 2%
+# of the provider-identified sample and remove exact duplicate tag profiles.
+df_base <- df
+uc_design <- make_prevalent_use_case_controls(df, min_share = 0.02)
+df <- uc_design$data
+uc_cols <- uc_design$columns
+N_uc_raw <- uc_design$retained_tags
+N_uc_duplicate <- length(uc_design$duplicate_profiles_removed)
 
 # IDL quintile
 df$IDL_Q <- cut(df$IDL_std,
@@ -179,8 +172,20 @@ N_prov <- n_distinct(df$provider_url)
 N_uc   <- length(uc_cols)
 ```
 
-The sample contains **`r format(N_obs, big.mark=",")`** unique product listings
-from **`r N_prov`** providers, with **`r N_uc`** use-case control dummies.
+The estimation sample contains **`r format(N_obs, big.mark=",")`** unique product
+listings from **`r N_prov`** identified providers. The parsimonious use-case design
+retains tags appearing in at least **`r uc_design$min_n` listings** (2% of the
+sample), yielding **`r N_uc`** distinct indicator profiles after removing
+**`r N_uc_duplicate`** exact duplicate profile.
+
+The use-case field is treated as multilabel rather than mutually exclusive.
+Tag strings are trimmed, converted to lower case, and empty values are removed;
+each retained tag then becomes a binary listing-level indicator. All retained
+indicators enter jointly as nuisance controls for intended application. Tags
+below the prevalence threshold are not pooled into an `other` category. Exact
+duplicate indicator profiles are removed deterministically, without consulting
+the outcome or the data-liquidity index, to avoid collinearity between tags that
+are always assigned together.
 
 | Symbol | Measure | Range | Construction |
 |--------|---------|------:|--------------|
@@ -228,7 +233,7 @@ var_labels <- c(
 summ$Variable <- var_labels[summ$Variable]
 
 kbl(summ, digits = 3, col.names = c("Variable", "Mean", "SD", "Min", "Median", "Max"),
-    caption = "Table 1 â€” Summary Statistics (N = 4,552)") %>%
+    caption = paste0("Table 1: Summary Statistics (N = ", format(N_obs, big.mark=","), ")")) %>%
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
   pack_rows("IDL Conditions", 1, 4) %>%
   pack_rows("Outcomes", 5, 9) %>%
@@ -238,29 +243,33 @@ kbl(summ, digits = 3, col.names = c("Variable", "Mean", "SD", "Min", "Median", "
 ## Correlation Matrix
 
 ```{r tbl-corr}
-cor_vars <- df %>% dplyr::select(C_score, T_rank, K_log, IDL_std, liquidity_count)
+cor_vars <- df %>% select(C_score, T_rank, K_log, IDL_std, liquidity_count)
 cor_mat  <- cor(cor_vars, use = "pairwise.complete.obs")
 
 # Pretty labels
 rownames(cor_mat) <- colnames(cor_mat) <- c("C", "T", "K", "IDL", "Y")
 
 kbl(round(cor_mat, 3),
-    caption = "Table 2 â€” Pairwise Correlations") %>%
+    caption = "Table 2: Pairwise Correlations") %>%
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
 ```
 
 ## IDL Quintile Gradient
 
-```{r fig-quintile, fig.cap="Figure 1 â€” Mean Realized Liquidity by IDL Quintile"}
+```{r fig-quintile, fig.cap="Figure 1: Mean Realized Liquidity by IDL Quintile"}
 q_means <- df %>%
   filter(!is.na(IDL_Q)) %>%
   group_by(IDL_Q) %>%
-  summarise(
-    mean_liq = mean(liquidity_count),
-    se       = sd(liquidity_count) / sqrt(n()),
-    n        = n(),
-    .groups  = "drop"
-  )
+  group_modify(~{
+    mean_model <- lm(liquidity_count ~ 1, data = .x)
+    mean_ct <- cluster_coeftable(mean_model, .x$provider_url)
+    tibble(
+      mean_liq = coef(mean_model)[1],
+      se = mean_ct["(Intercept)", "Std. Error"],
+      n = nrow(.x)
+    )
+  }) %>%
+  ungroup()
 
 ggplot(q_means, aes(x = IDL_Q, y = mean_liq)) +
   geom_col(fill = "#2c7fb8", width = 0.65) +
@@ -279,7 +288,7 @@ ggplot(q_means, aes(x = IDL_Q, y = mean_liq)) +
 The outcome $Y_i \in \{0,1,2,3,4\}$ counts how many transactional-readiness
 signals a listing activates.  Because the outcome is a bounded count with
 moderate overdispersion, we estimate a **Poisson pseudo-maximum-likelihood**
-model with heteroskedasticity-robust standard errors:
+model with standard errors clustered by provider:
 
 $$
 E[Y_i \mid \mathbf{X}_i] = \exp\!\Big(\alpha + \beta\,\text{IDL}_i^{\text{std}}
@@ -298,20 +307,22 @@ fml_main <- as.formula(
          paste(uc_cols, collapse = " + "))
 )
 
-m_pois <- fepois(fml_main, data = df, vcov = "hetero")
+m_pois <- glm(fml_main, data = df, family = poisson(link = "log"))
 
 # Extract key stats
-coefs <- coeftable(m_pois)
+coefs <- cluster_coeftable(m_pois, df$provider_url)
 b     <- coefs["IDL_std", "Estimate"]
 se_b  <- coefs["IDL_std", "Std. Error"]
-z_b   <- coefs["IDL_std", "z value"]
-p_b   <- coefs["IDL_std", "Pr(>|z|)"]
+t_b   <- coefs["IDL_std", "t value"]
+p_b   <- coefs["IDL_std", "Pr(>|t|)"]
 irr   <- exp(b)
-irr_lo <- exp(b - 1.96 * se_b)
-irr_hi <- exp(b + 1.96 * se_b)
+main_ci <- cluster_confint(coefs)
+irr_lo <- exp(main_ci["IDL_std", "lower"])
+irr_hi <- exp(main_ci["IDL_std", "upper"])
 n_obs <- nobs(m_pois)
 ll    <- logLik(m_pois)
-pr2   <- 1 - as.numeric(ll) / as.numeric(logLik(fepois(liquidity_count ~ 1, data = df)))
+pr2   <- 1 - as.numeric(ll) / as.numeric(logLik(glm(liquidity_count ~ 1, data = df,
+                                                    family = poisson(link = "log"))))
 ```
 
 ## Results
@@ -319,7 +330,7 @@ pr2   <- 1 - as.numeric(ll) / as.numeric(logLik(fepois(liquidity_count ~ 1, data
 ```{r tbl-main-result}
 main_tbl <- tibble(
   ` ` = c("IDL (std.)", "", "Provider listing count", "Provider rating",
-          "Use-case dummies", "Observations", "Pseudo RÂ²"),
+          "Use-case controls", "Observations", "Pseudo RÂ²"),
   `Coefficient` = c(
     sprintf("%.4f", b), sprintf("(%.4f)", se_b),
     sprintf("%.4f", coefs["provider_n", "Estimate"]),
@@ -340,19 +351,21 @@ main_tbl <- tibble(
   ),
   `p` = c(
     ifelse(p_b < 0.001, "< .001", sprintf("%.3f", p_b)), "",
-    ifelse(coefs["provider_n", "Pr(>|z|)"] < 0.001, "< .001",
-           sprintf("%.3f", coefs["provider_n", "Pr(>|z|)"])),
-    ifelse(coefs["provider_rating", "Pr(>|z|)"] < 0.001, "< .001",
-           sprintf("%.3f", coefs["provider_rating", "Pr(>|z|)"])),
+    ifelse(coefs["provider_n", "Pr(>|t|)"] < 0.001, "< .001",
+           sprintf("%.3f", coefs["provider_n", "Pr(>|t|)"])),
+    ifelse(coefs["provider_rating", "Pr(>|t|)"] < 0.001, "< .001",
+           sprintf("%.3f", coefs["provider_rating", "Pr(>|t|)"])),
     "", "", ""
   )
 )
 
 kbl(main_tbl,
-    caption = "Table 3 â€” Main Specification: Poisson Regression of Liquidity Count on IDL",
+    caption = "Table 3: Main Specification: Poisson Regression of Liquidity Count on IDL",
     align = c("l", "r", "r", "r", "r")) %>%
   kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
-  footnote(general = "Poisson PML with Huberâ€“White robust SEs. Use-case dummies retained if â‰¥ 2 occurrences (503 controls).")
+  footnote(general = paste0("Poisson PML with provider-clustered SEs (",
+                            N_prov, " clusters). ", N_uc,
+                            " prevalent use-case indicators retained (â‰¥2% of listings)."))
 ```
 
 **Interpretation.** A one-standard-deviation increase in the IDL index
@@ -360,484 +373,44 @@ raises the expected number of transactional-readiness signals by a factor
 of **`r sprintf("%.3f", irr)`** (IRR, 95% CI [`r sprintf("%.3f", irr_lo)`,
 `r sprintf("%.3f", irr_hi)`], *p* < .001).
 
-## Disaggregated Effects
+## Use-Case Control Parsimony
 
-```{r disagg-poisson}
-fml_disagg <- as.formula(
-  paste0("liquidity_count ~ C_score + T_rank + K_log + provider_n + provider_rating + rating_missing + ",
-         paste(uc_cols, collapse = " + "))
-)
-m_disagg <- fepois(fml_disagg, data = df, vcov = "hetero")
-cd <- coeftable(m_disagg)
+The primary 2% prevalence rule is fixed independently of the outcome. To assess
+whether the result depends on that cutoff, we re-estimate the provider-clustered
+Poisson model at nearby thresholds. This retains the marketplace's multilabel
+use-case structure while avoiding hundreds of sparse nuisance parameters.
 
-disagg_tbl <- tibble(
-  Condition = c("Semantic Clarity (C)", "Temporal Intensity (T)", "Composability (K)"),
-  Coef      = sprintf("%.4f", cd[c("C_score", "T_rank", "K_log"), "Estimate"]),
-  SE        = sprintf("(%.4f)", cd[c("C_score", "T_rank", "K_log"), "Std. Error"]),
-  IRR       = sprintf("%.3f", exp(cd[c("C_score", "T_rank", "K_log"), "Estimate"])),
-  p         = ifelse(cd[c("C_score", "T_rank", "K_log"), "Pr(>|z|)"] < 0.001,
-                     "< .001",
-                     sprintf("%.3f", cd[c("C_score", "T_rank", "K_log"), "Pr(>|z|)"]))
-)
-
-kbl(disagg_tbl,
-    caption = "Table 4 â€” Disaggregated Poisson: Individual IDL Components",
-    align = c("l", "r", "r", "r", "r")) %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
-  footnote(general = "Same specification as Table 3, replacing IDL composite with its three components. All three contribute positively and significantly.")
-```
-
-# Robustness: Regression Variants
-
-```{r robustness-regressions}
-# 1. OLS
-fml_ols <- fml_main
-m_ols <- feols(fml_ols, data = df, vcov = "hetero")
-ols_b  <- coeftable(m_ols)["IDL_std", "Estimate"]
-ols_se <- coeftable(m_ols)["IDL_std", "Std. Error"]
-ols_p  <- coeftable(m_ols)["IDL_std", "Pr(>|t|)"]
-
-# 2. Ordered logit
-m_ologit <- MASS::polr(ordered(liquidity_count) ~ IDL_std + provider_n + provider_rating + rating_missing,
-                        data = df, method = "logistic", Hess = TRUE)
-ologit_coefs <- summary(m_ologit)$coefficients
-ologit_b  <- ologit_coefs["IDL_std", "Value"]
-ologit_se <- ologit_coefs["IDL_std", "Std. Error"]
-ologit_t  <- ologit_coefs["IDL_std", "t value"]
-ologit_p  <- 2 * pnorm(-abs(ologit_t))
-
-# 3. Provider FE Poisson
-m_pfe <- fepois(liquidity_count ~ IDL_std + provider_n + provider_rating + rating_missing | provider_url,
-                data = df, vcov = "hetero")
-pfe_b  <- coeftable(m_pfe)["IDL_std", "Estimate"]
-pfe_se <- coeftable(m_pfe)["IDL_std", "Std. Error"]
-pfe_p  <- coeftable(m_pfe)["IDL_std", "Pr(>|z|)"]
-
-# 4. No use-case controls
-m_nouc <- fepois(liquidity_count ~ IDL_std + provider_n + provider_rating + rating_missing,
-                 data = df, vcov = "hetero")
-nouc_b  <- coeftable(m_nouc)["IDL_std", "Estimate"]
-nouc_se <- coeftable(m_nouc)["IDL_std", "Std. Error"]
-nouc_p  <- coeftable(m_nouc)["IDL_std", "Pr(>|z|)"]
-
-# 5. Binary J_i (legacy union indicator)
-fml_ji <- as.formula(
-  paste0("liquidity_count ~ J_i + provider_n + provider_rating + rating_missing + ",
-         paste(uc_cols, collapse = " + "))
-)
-m_ji <- fepois(fml_ji, data = df, vcov = "hetero")
-ji_b  <- coeftable(m_ji)["J_i", "Estimate"]
-ji_se <- coeftable(m_ji)["J_i", "Std. Error"]
-ji_p  <- coeftable(m_ji)["J_i", "Pr(>|z|)"]
-
-# 6. Above-median binary
-df$IDL_high <- as.integer(df$IDL_std > 0)
-fml_bin <- as.formula(
-  paste0("liquidity_count ~ IDL_high + provider_n + provider_rating + rating_missing + ",
-         paste(uc_cols, collapse = " + "))
-)
-m_bin <- fepois(fml_bin, data = df, vcov = "hetero")
-bin_b  <- coeftable(m_bin)["IDL_high", "Estimate"]
-bin_se <- coeftable(m_bin)["IDL_high", "Std. Error"]
-bin_p  <- coeftable(m_bin)["IDL_high", "Pr(>|z|)"]
-
-# 7. IDL quintile dummies
-df$IDL_Q2 <- relevel(factor(df$IDL_Q), ref = "Q1")
-fml_q <- as.formula(
-  paste0("liquidity_count ~ IDL_Q2 + provider_n + provider_rating + rating_missing + ",
-         paste(uc_cols, collapse = " + "))
-)
-m_q <- fepois(fml_q, data = df, vcov = "hetero")
-q5_b  <- coeftable(m_q)["IDL_Q2Q5", "Estimate"]
-q5_se <- coeftable(m_q)["IDL_Q2Q5", "Std. Error"]
-q5_p  <- coeftable(m_q)["IDL_Q2Q5", "Pr(>|z|)"]
-
-fmt_p <- function(p) ifelse(p < 0.001, "< .001", sprintf("%.3f", p))
-
-rob_tbl <- tibble(
-  Specification = c(
-    "(1) OLS",
-    "(2) Ordered Logit (no UC FE)",
-    "(3) Poisson + Provider FE",
-    "(4) Poisson, no UC controls",
-    "(5) Binary J_i (legacy)",
-    "(6) Above-median IDL",
-    "(7) Q5 vs Q1 (quintile dummies)"
-  ),
-  Estimate = c(
-    sprintf("%.3f", ols_b),
-    sprintf("%.3f", ologit_b),
-    sprintf("%.3f", pfe_b),
-    sprintf("%.3f", nouc_b),
-    sprintf("%.3f", ji_b),
-    sprintf("%.3f", bin_b),
-    sprintf("%.3f", q5_b)
-  ),
-  SE = c(
-    sprintf("(%.3f)", ols_se),
-    sprintf("(%.3f)", ologit_se),
-    sprintf("(%.3f)", pfe_se),
-    sprintf("(%.3f)", nouc_se),
-    sprintf("(%.3f)", ji_se),
-    sprintf("(%.3f)", bin_se),
-    sprintf("(%.3f)", q5_se)
-  ),
-  `IRR / OR` = c(
-    "â€”",
-    sprintf("%.3f", exp(ologit_b)),
-    sprintf("%.3f", exp(pfe_b)),
-    sprintf("%.3f", exp(nouc_b)),
-    sprintf("%.3f", exp(ji_b)),
-    sprintf("%.3f", exp(bin_b)),
-    sprintf("%.3f", exp(q5_b))
-  ),
-  p = c(fmt_p(ols_p), fmt_p(ologit_p), fmt_p(pfe_p), fmt_p(nouc_p),
-        fmt_p(ji_p), fmt_p(bin_p), fmt_p(q5_p))
-)
-
-kbl(rob_tbl,
-    caption = "Table 5 â€” Robustness: Alternative Regression Specifications",
-    align = c("l", "r", "r", "r", "r")) %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
-  footnote(general = c(
-    "Row 1: OLS with robust SEs, coefficient is Î².",
-    "Row 2: Ordered logit without use-case FE, shows OR.",
-    "Rows 3â€“7: Poisson PML with robust SEs, shows IRR.",
-    "All specifications include provider controls. UC dummies included except rows 2,3,4."
-  ))
-```
-
-All seven alternative specifications return a **positive and statistically
-significant** association between IDL and realized liquidity.
-
-## Quintile Gradient Detail
-
-```{r fig-quintile-outcomes, fig.cap="Figure 2 â€” Outcome Prevalence by IDL Quintile"}
-q_out <- df %>%
-  filter(!is.na(IDL_Q)) %>%
-  group_by(IDL_Q) %>%
-  summarise(
-    `Payment Modality` = mean(payment_modality),
-    `Price Displayed`  = mean(price_displayed),
-    `Free Sample`      = mean(free_sample_available),
-    `API Delivery`     = mean(api_method),
-    .groups = "drop"
-  ) %>%
-  pivot_longer(-IDL_Q, names_to = "Outcome", values_to = "Prevalence")
-
-ggplot(q_out, aes(x = IDL_Q, y = Prevalence, fill = Outcome)) +
-  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
-  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, .08))) +
-  scale_fill_brewer(palette = "Set2") +
-  labs(x = "IDL Quintile", y = "Outcome Prevalence (%)") +
-  theme(panel.grid.major.x = element_blank())
-```
-
-# Robustness: Fuzzy-Set Qualitative Comparative Analysis (fsQCA)
-
-The fsQCA provides a **configurational complement** to the regression analysis.
-While Poisson regression estimates the *average marginal effect* of the IDL
-index on liquidity count, fsQCA tests whether specific **combinations of
-conditions** (C, T, K) are **set-theoretically sufficient** to produce high
-realized liquidity.  The two approaches operate under fundamentally different
-logics:
-
-| | Regression | fsQCA |
-|-----|:-----------|:------|
-| Question | Does more IDL produce more signals *on average*? | Is CÂ·TÂ·K a reliable *recipe* for high liquidity? |
-| Logic | Symmetric, net-effect | Asymmetric, set-theoretic |
-| Equifinality | Not modelled | Explicitly identified |
-| Causal asymmetry | Assumed symmetric | ~CÂ·~TÂ·~K need not explain ~Y |
-
-## Fuzzy Calibration
-
-Continuous measures are transformed into fuzzy-set membership scores $\in [0,1]$
-using direct calibration with three qualitative anchors (fully out, crossover,
-fully in).  We compare two operationalisations of semantic clarity:
-
-- **C~old~**: the binary NLP prediction (`semantic_pred` âˆˆ {0, 1}), used as crisp set.
-- **C~new~**: the continuous classifier score (`semantic_score` âˆˆ [0.25, 0.77]), calibrated as fuzzy set.
-
-```{r fsqca-calibration}
-# Calibrate
-df$fs_C_old <- as.numeric(df$c_semantic)  # crisp 0/1
-
-# C_new: continuous score.  Anchors chosen from distribution:
-#   fully-out = 0.30 (~5th pct), crossover = 0.52 (threshold), fully-in = 0.73 (~95th pct)
-df$fs_C_new <- calibrate(df$C_score, type = "fuzzy", thresholds = c(0.30, 0.52, 0.73))
-df$fs_T     <- calibrate(df$T_rank,  type = "fuzzy", thresholds = c(0, 4, 9))
-df$fs_K     <- calibrate(df$k_hard_key_count, type = "fuzzy", thresholds = c(0, 1, 5))
-df$fs_OUT   <- calibrate(df$liquidity_count,  type = "fuzzy", thresholds = c(0, 2, 4))
-
-# Standard nudge: 0.5 â†’ 0.501 to resolve crossover ambiguity
-nudge <- function(x) ifelse(x == 0.5, x + 0.001, x)
-df$fs_C_new <- nudge(df$fs_C_new)
-df$fs_T     <- nudge(df$fs_T)
-df$fs_K     <- nudge(df$fs_K)
-df$fs_OUT   <- nudge(df$fs_OUT)
-
-cal_tbl <- tibble(
-  Set = c("C (NLP prediction, crisp)", "C (classifier score, fuzzy)",
-          "T (temporal)", "K (composability)", "Y (liquidity)"),
-  `Raw measure` = c("semantic_pred {0,1}", "semantic_score [0.25â€“0.77]",
-                     "T_rank (0â€“9)", "hard_key_count", "liquidity_count (0â€“4)"),
-  `Fully out` = c(0, 0.30, 0, 0, 0),
-  Crossover   = c("â€”", 0.52, 4, 1, 2),
-  `Fully in`  = c(1, 0.73, 9, 5, 4),
-  `Mean fs`   = c(mean(df$fs_C_old), mean(df$fs_C_new), mean(df$fs_T),
-                  mean(df$fs_K), mean(df$fs_OUT))
-)
-
-kbl(cal_tbl, digits = 3,
-    caption = "Table 6 â€” Fuzzy-Set Calibration Anchors and Summary") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
-  footnote(general = "Direct calibration using QCA::calibrate(). C_new anchors: 5th percentile (fully out), classifier threshold (crossover), 95th percentile (fully in). Cases at 0.5 nudged +0.001.")
-```
-
-## Necessity Analysis
-
-A condition is **necessary** for an outcome if its consistency score â‰¥ 0.90.
-
-```{r fsqca-necessity}
-qca_old <- data.frame(C = df$fs_C_old, T = df$fs_T, K = df$fs_K, OUT = df$fs_OUT)
-qca_new <- data.frame(C = df$fs_C_new, T = df$fs_T, K = df$fs_K, OUT = df$fs_OUT)
-
-# Extended necessity terms
-build_nec <- function(fs_c, fs_t, fs_k, fs_out) {
-  nec_df <- data.frame(
-    C      = fs_c,
-    `~C`   = 1 - fs_c,
-    T      = fs_t,
-    `~T`   = 1 - fs_t,
-    K      = fs_k,
-    `~K`   = 1 - fs_k,
-    `C+T`  = pmax(fs_c, fs_t),
-    `C+K`  = pmax(fs_c, fs_k),
-    `T+K`  = pmax(fs_t, fs_k),
-    `C+T+K`= pmax(fs_c, fs_t, fs_k),
-    OUT    = fs_out,
-    check.names = FALSE
+```{r use-case-threshold-sensitivity}
+uc_threshold_results <- lapply(c(0.01, 0.015, 0.02, 0.03, 0.05), function(threshold) {
+  design <- make_prevalent_use_case_controls(df_base, min_share = threshold)
+  d <- design$data
+  f <- as.formula(
+    paste0("liquidity_count ~ IDL_std + provider_n + provider_rating + rating_missing + ",
+           paste(design$columns, collapse = " + "))
   )
-  res <- pof(setms = nec_df[, 1:10], outcome = "OUT", data = nec_df, relation = "necessity")
-  out <- res$incl.cov
+  model <- glm(f, data = d, family = poisson(link = "log"))
+  ct <- cluster_coeftable(model, d$provider_url)
+  ci <- cluster_confint(ct)
   tibble(
-    Expression  = rownames(out),
-    Consistency = out[, "inclN"],
-    Coverage    = out[, "covN"]
-  )
-}
-
-nec_old <- build_nec(df$fs_C_old, df$fs_T, df$fs_K, df$fs_OUT) %>% mutate(Model = "C_old")
-nec_new <- build_nec(df$fs_C_new, df$fs_T, df$fs_K, df$fs_OUT) %>% mutate(Model = "C_new")
-nec_cmp <- bind_rows(nec_old, nec_new) %>%
-  pivot_wider(names_from = Model,
-              values_from = c(Consistency, Coverage),
-              names_sep = " ")
-
-kbl(nec_cmp, digits = 4,
-    caption = "Table 7 â€” Necessity Analysis: C_old vs C_new") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE,
-                font_size = 11) %>%
-  footnote(general = "'+' = logical OR (disjunction), '~' = negation. Scores â‰¥ 0.90 bolded.")
-```
-
-```{r fig-necessity, fig.cap="Figure 3 â€” Necessity Consistency: C_old vs C_new"}
-nec_plot <- bind_rows(
-  nec_old %>% filter(Expression %in% c("C", "T", "K", "C+T", "C+K", "T+K", "C+T+K")),
-  nec_new %>% filter(Expression %in% c("C", "T", "K", "C+T", "C+K", "T+K", "C+T+K"))
-)
-
-ggplot(nec_plot, aes(x = reorder(Expression, Consistency), y = Consistency,
-                     fill = Model)) +
-  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
-  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red", linewidth = 0.5) +
-  annotate("text", x = 0.6, y = 0.915, label = "0.90 threshold", color = "red",
-           hjust = 0, size = 3) +
-  coord_flip() +
-  scale_fill_manual(values = c("C_old" = "#7570b3", "C_new" = "#1b9e77"),
-                    labels = c("C_old" = "NLP prediction (crisp)", "C_new" = "Classifier score (fuzzy)")) +
-  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
-  labs(x = NULL, y = "Necessity Consistency", fill = "Clarity measure") +
-  theme(legend.position = "bottom")
-```
-
-With the continuous classifier score, $C \cup T$ crosses the necessity
-threshold (consistency = **`r sprintf("%.3f", nec_new$Consistency[nec_new$Expression == "C+T"])`**),
-while neither condition alone is individually necessary.
-
-## Truth Tables
-
-```{r fsqca-truthtables}
-tt_old <- truthTable(qca_old, outcome = "OUT", conditions = c("C", "T", "K"),
-                     incl.cut = 0.80, n.cut = 30,
-                     sort.by = c("incl", "n"), complete = FALSE)
-
-tt_new <- truthTable(qca_new, outcome = "OUT", conditions = c("C", "T", "K"),
-                     incl.cut = 0.80, n.cut = 30,
-                     sort.by = c("incl", "n"), complete = FALSE)
-
-format_tt <- function(tt, label) {
-  d <- tt$tt
-  d %>%
-    mutate(
-      incl = ifelse(is.na(incl), "â€”", sprintf("%.4f", as.numeric(incl))),
-      PRI  = ifelse(is.na(PRI),  "â€”", sprintf("%.4f", as.numeric(PRI)))
-    ) %>%
-    dplyr::select(C, T, K, n, incl, PRI, OUT) %>%
-    mutate(Model = label)
-}
-
-tt_both <- bind_rows(
-  format_tt(tt_old, "C_old (NLP prediction)"),
-  format_tt(tt_new, "C_new (classifier score)")
-)
-
-kbl(tt_both %>% dplyr::select(-Model),
-    col.names = c("C", "T", "K", "N", "Incl.", "PRI", "OUT"),
-    caption = "Table 8 â€” fsQCA Truth Tables (inclusion cut = 0.80, N cut = 30)") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
-  pack_rows("Panel A: C_old (NLP prediction)", 1, nrow(format_tt(tt_old, ""))) %>%
-  pack_rows("Panel B: C_new (classifier score)",
-            nrow(format_tt(tt_old, "")) + 1, nrow(tt_both))
-```
-
-## Sufficient Configurations
-
-```{r fsqca-minimisation}
-sol_old <- tryCatch(minimize(tt_old, details = TRUE), error = function(e) NULL)
-sol_new <- tryCatch(minimize(tt_new, details = TRUE), error = function(e) NULL)
-
-format_sol <- function(sol) {
-  if (is.null(sol)) return("No sufficient configurations found.")
-  paste(capture.output(print(sol)), collapse = "\n")
-}
-```
-
-### Panel A â€” C~old~ (NLP prediction)
-
-```{r sol-old, results='asis'}
-cat("```\n")
-cat(format_sol(sol_old))
-cat("\n```\n")
-```
-
-### Panel B â€” C~new~ (classifier score)
-
-```{r sol-new, results='asis'}
-cat("```\n")
-cat(format_sol(sol_new))
-cat("\n```\n")
-```
-
-## Sufficiency Consistency Comparison
-
-```{r tbl-suff-compare}
-configs <- list(
-  "CÂ·TÂ·K" = function(d, c_col) pmin(d[[c_col]], d$fs_T, d$fs_K),
-  "CÂ·T"   = function(d, c_col) pmin(d[[c_col]], d$fs_T),
-  "CÂ·K"   = function(d, c_col) pmin(d[[c_col]], d$fs_K),
-  "TÂ·K"   = function(d, c_col) pmin(d$fs_T, d$fs_K),
-  "C"     = function(d, c_col) d[[c_col]],
-  "T"     = function(d, c_col) d$fs_T,
-  "K"     = function(d, c_col) d$fs_K
-)
-
-suff_rows <- lapply(names(configs), function(cfg_name) {
-  fn <- configs[[cfg_name]]
-
-  s_old <- fn(df, "fs_C_old")
-  cons_old <- sum(pmin(s_old, df$fs_OUT)) / sum(s_old)
-  cov_old  <- sum(pmin(s_old, df$fs_OUT)) / sum(df$fs_OUT)
-
-  s_new <- fn(df, "fs_C_new")
-  cons_new <- sum(pmin(s_new, df$fs_OUT)) / sum(s_new)
-  cov_new  <- sum(pmin(s_new, df$fs_OUT)) / sum(df$fs_OUT)
-
-  tibble(Configuration = cfg_name,
-         `Cons (C_old)` = cons_old, `Cov (C_old)` = cov_old,
-         `Cons (C_new)` = cons_new, `Cov (C_new)` = cov_new,
-         `Î” Cons` = cons_new - cons_old)
-})
-suff_tbl <- bind_rows(suff_rows)
-
-kbl(suff_tbl, digits = 4,
-    caption = "Table 9 â€” Sufficiency Consistency & Coverage: C_old vs C_new") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
-```
-
-```{r fig-suff-compare, fig.cap="Figure 4 â€” Sufficiency Consistency by Configuration (C_old vs C_new)"}
-suff_long <- suff_tbl %>%
-  dplyr::select(Configuration, `Cons (C_old)`, `Cons (C_new)`) %>%
-  pivot_longer(-Configuration, names_to = "Model", values_to = "Consistency") %>%
-  mutate(Model = ifelse(Model == "Cons (C_old)", "C_old", "C_new"))
-
-ggplot(suff_long, aes(x = reorder(Configuration, Consistency),
-                      y = Consistency, fill = Model)) +
-  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
-  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red", linewidth = 0.5) +
-  annotate("text", x = 0.6, y = 0.815, label = "0.80 threshold", color = "red",
-           hjust = 0, size = 3) +
-  coord_flip() +
-  scale_fill_manual(values = c("C_old" = "#7570b3", "C_new" = "#1b9e77"),
-                    labels = c("C_old" = "NLP prediction (crisp)", "C_new" = "Classifier score (fuzzy)")) +
-  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
-  labs(x = NULL, y = "Sufficiency Consistency", fill = "Clarity measure") +
-  theme(legend.position = "bottom")
-```
-
-# Summary of Findings
-
-```{r tbl-synthesis}
-synth <- tibble(
-  Evidence = c(
-    "Main Poisson (IDL â†’ Y)",
-    "OLS",
-    "Ordered logit",
-    "Provider FE Poisson",
-    "Legacy binary J_i",
-    "Quintile Q5 vs Q1",
-    "fsQCA CÂ·TÂ·K (C_new)"
-  ),
-  `Effect Size` = c(
-    sprintf("IRR = %.3f", irr),
-    sprintf("Î² = %.3f", ols_b),
-    sprintf("OR = %.3f", exp(ologit_b)),
-    sprintf("IRR = %.3f", exp(pfe_b)),
-    sprintf("IRR = %.3f", exp(ji_b)),
-    sprintf("IRR = %.3f", exp(q5_b)),
-    sprintf("Cons. = %.3f", suff_tbl$`Cons (C_new)`[suff_tbl$Configuration == "CÂ·TÂ·K"])
-  ),
-  Significant = c(
-    "Yes (p < .001)", "Yes (p < .001)", "Yes (p < .001)",
-    ifelse(pfe_p < 0.05, "Yes", "No"),
-    ifelse(ji_p < 0.05, "Yes", "No"),
-    ifelse(q5_p < 0.05, "Yes", "No"),
-    ifelse(suff_tbl$`Cons (C_new)`[suff_tbl$Configuration == "CÂ·TÂ·K"] >= 0.75,
-           "Above 0.75 cut", "Below 0.75 cut")
-  ),
-  `Method` = c("Poisson PML", "OLS", "Ordered Logit", "Poisson + FE",
-               "Poisson PML", "Poisson PML", "fsQCA (set-theoretic)")
-)
-
-kbl(synth,
-    caption = "Table 10 â€” Convergent Evidence: All Approaches Point in the Same Direction") %>%
-  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
-```
-
-## Methodological Recommendation
-
-**Main specification â†’ Poisson regression** (Table 3). This provides a clear,
-single estimate of the IDLâ€“liquidity relationship with standard inferential
-support (SE, CI, p-value), controls for use-case composition and provider
-heterogeneity, and yields a directly interpretable effect size (IRR).
-
-**Robustness â†’ fsQCA** (Section 5). The configurational analysis complements
-the regression by (a) operating under a fundamentally different analytical logic
-(set-theoretic rather than correlational), (b) revealing equifinal pathways, and
-(c) demonstrating that using the continuous classifier score instead of the binary
-prediction eliminates the theoretically inconsistent substitution patterns that
-previously afflicted the QCA results.
-
-*Both approaches converge:* higher IDL is associated with more transactional-readiness
-signals, whether assessed as an average marginal effect or as a sufficient
-configurational recipe.
+    `Minimum prevalence` = sprintf("%.1f%%", 100 * threshold),
+    `Minimum listings` = design$min_n,
+    `Use-case controls` = length(design$columns),
+    IRR = exp(ct["IDL_std", "Estimate"]),
+    `95% CI lower` = exp(ci["IDL_std", "lower"]),
+    `95% CI upper` = exp(ci["IDL_std", "upper"]),
+    p = ct["IDL_st×Îü¶‰ËkºwµçM˜ˆ°½±½¥Ñ}ˆ¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°Á™•}ˆ¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°¹½Õ}ˆ¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°©¥}ˆ¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°‰¥¹}ˆ¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°ÄÕ}ˆ¤(€€¤°(€M€ôŒ (€€€ÍÁÉ¥¹Ñ˜ ˆ ”¸Í˜¤ˆ°½±Í}Í”¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ ”¸Í˜¤ˆ°½±½¥Ñ}Í”¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ ”¸Í˜¤ˆ°Á™•}Í”¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ ”¸Í˜¤ˆ°¹½Õ}Í”¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ ”¸Í˜¤ˆ°©¥}Í”¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ ”¸Í˜¤ˆ°‰¥¹}Í”¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ ”¸Í˜¤ˆ°ÄÕ}Í”¤(€€¤°(€%IH€¼=I€€ôŒ (€€€€‰9ˆ°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°•áÀ¡½±½¥Ñ}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°•áÀ¡Á™•}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°•áÀ¡¹½Õ}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°•áÀ¡©¥}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°•áÀ¡‰¥¹}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°•áÀ¡ÄÕ}ˆ¤¤(€€¤°(€À€ôŒ¡™µÑ}À¡½±Í}À¤°™µÑ}À¡½±½¥Ñ}À¤°™µÑ}À¡Á™•}À¤°™µÑ}À¡¹½Õ}À¤°(€€€€€€€™µÑ}À¡©¥}À¤°™µÑ}À¡‰¥¹}À¤°™µÑ}À¡ÄÕ}À¤¤(¤()­‰°¡É½‰}Ñ‰°°(€€€…ÁÑ¥½¸€ô€‰Q…‰±”€ÔèI½‰ÕÍÑ¹•ÍÌè±Ñ•É¹…Ñ¥Ù”I•É•ÍÍ¥½¸MÁ•¥™¥…Ñ¥½¹Ìˆ°(€€€…±¥¸€ôŒ ‰°ˆ°€‰Èˆ°€‰Èˆ°€‰Èˆ°€‰Èˆ¤¤€”ø”(€­…‰±•}ÍÑå±¥¹œ¡‰½½ÑÍÑÉ…Á}½ÁÑ¥½¹Ì€ôŒ ‰ÍÑÉ¥Á•ˆ°€‰½¹‘•¹Í•ˆ¤°™Õ±±}İ¥‘Ñ €ô1M¤€”ø”(€™½½Ñ¹½Ñ”¡•¹•É…°€ôŒ (€€€€‰±°É•Á½ÉÑ•MÌ…É”±ÕÍÑ•É•‰äÁÉ½Ù¥‘•È¸ˆ°(€€€€‰I½Ü€Äè=1L½•™™¥¥•¹Ğ¥Ìƒ:È¸I½Ü€Èè½É‘•É•±½¥Ğİ¥Ñ¡½ÕĞÕÍ”µ…Í”½¹ÑÉ½±Ì°Í¡½İ¥¹œ=H¸ˆ°(€€€€‰I½İÌ€ÏŠLÜèA½¥ÍÍ½¸A50°Í¡½İ¥¹œ%IH¸I½Ü€Ì¥¹±Õ‘•ÌÁÉ½Ù¥‘•È™¥á••™™•ÑÌ…¹ÁÉ•Ù…±•¹ĞÕÍ”µ…Í”½¹ÑÉ½±Ì¸ˆ°(€€€€‰AÉ½Ù¥‘•È½¹ÑÉ½±Ì•¹Ñ•È…±°ÍÁ•¥™¥…Ñ¥½¹Ì•á•ÁĞÑ¡”ÁÉ½Ù¥‘•Èµµ½‘•°¸ˆ(€€¤¤)€()Q¡”ÁÉ½Ù¥‘•È™¥á•µ•™™•ÑÌ•ÍÑ¥µ…Ñ”¥Ì…±Í¼É½‰ÕÍĞÑ¼HÈ‰¥…ÌµÉ•‘Õ•±ÕÍÑ•È)¥¹™•É•¹”İ¥Ñ M…ÑÑ•ÉÑ¡İ…¥Ñ”‘•É••Ì½˜™É••‘½´€¡M€ô€¨©ÈÍÁÉ¥¹Ñ˜ ˆ”¸Ñ˜ˆ°Á™•}ÈÉ}Í”¥€¨¨°)‘˜€ô€¨©ÈÍÁÉ¥¹Ñ˜ ˆ”¸Å˜ˆ°Á™•}ÈÉ}‘˜¥€¨¨°€©À¨€¨©È¥™•±Í”¡Á™•}ÈÉ}À€ğ€¸ÀÀÄ°€ˆğ€¸ÀÀÄˆ°ÍÁÉ¥¹Ñ˜ ˆô€”¸Í˜ˆ°Á™•}ÈÉ}À¤¥€¨¨¤¸()±°Í•Ù•¸…±Ñ•É¹…Ñ¥Ù”ÍÁ•¥™¥…Ñ¥½¹ÌÉ•ÑÕÉ¸„€¨©Á½Í¥Ñ¥Ù”…¹ÍÑ…Ñ¥ÍÑ¥…±±ä)Í¥¹¥™¥…¹Ğ¨¨…ÍÍ½¥…Ñ¥½¸‰•Ñİ••¸%0…¹É•…±¥é•±¥ÅÕ¥‘¥Ñä¸((ŒŒEÕ¥¹Ñ¥±”É…‘¥•¹Ğ•Ñ…¥°()íÈ™¥œµÅÕ¥¹Ñ¥±”µ½ÕÑ½µ•Ì°™¥œ¹…Àô‰¥ÕÉ”€Èè=ÕÑ½µ”AÉ•Ù…±•¹”‰ä%0EÕ¥¹Ñ¥±”‰ô)Å}½ÕĞ€ğ´‘˜€”ø”(€™¥±Ñ•È …¥Ì¹¹„¡%1}D¤¤€”ø”(€É½ÕÁ}‰ä¡%1}D¤€”ø”(€ÍÕµµ…É¥Í” (€€€A…åµ•¹Ğ5½‘…±¥Ñå€€ôµ•…¸¡Á…åµ•¹Ñ}µ½‘…±¥Ñä¤°(€€€AÉ¥”¥ÍÁ±…å•‘€€€ôµ•…¸¡ÁÉ¥•}‘¥ÍÁ±…å•¤°(€€€É•”M…µÁ±•€€€€€€€ôµ•…¸¡™É••}Í…µÁ±•}…Ù…¥±…‰±”¤°(€€€A$•±¥Ù•Éå€€€€€€ôµ•…¸¡…Á¥}µ•Ñ¡½¤°(€€€€¹É½ÕÁÌ€ô€‰‘É½Àˆ(€€¤€”ø”(€Á¥Ù½Ñ}±½¹•È µ%1}D°¹…µ•Í}Ñ¼€ô€‰=ÕÑ½µ”ˆ°Ù…±Õ•Í}Ñ¼€ô€‰AÉ•Ù…±•¹”ˆ¤()Á±½Ğ¡Å}½ÕĞ°…•Ì¡à€ô%1}D°ä€ôAÉ•Ù…±•¹”°™¥±°€ô=ÕÑ½µ”¤¤€¬(€•½µ}½°¡Á½Í¥Ñ¥½¸€ôÁ½Í¥Ñ¥½¹}‘½‘”¡İ¥‘Ñ €ô€À¸Ü¤°İ¥‘Ñ €ô€À¸ØÔ¤€¬(€Í…±•}å}½¹Ñ¥¹Õ½ÕÌ¡±…‰•±Ì€ôÁ•É•¹Ñ}™½Éµ…Ğ ¤°•áÁ…¹€ô•áÁ…¹Í¥½¸¡µÕ±Ğ€ôŒ À°€¸Àà¤¤¤€¬(€Í…±•}™¥±±}‰É•İ•È¡Á…±•ÑÑ”€ô€‰M•ĞÈˆ¤€¬(€±…‰Ì¡à€ô€‰%0EÕ¥¹Ñ¥±”ˆ°ä€ô€‰=ÕÑ½µ”AÉ•Ù…±•¹”€ ”¤ˆ¤€¬(€Ñ¡•µ”¡Á…¹•°¹É¥¹µ…©½È¹à€ô•±•µ•¹Ñ}‰±…¹¬ ¤¤)€((ŒI½‰ÕÍÑ¹•ÍÌèÕééäµM•ĞEÕ…±¥Ñ…Ñ¥Ù”½µÁ…É…Ñ¥Ù”¹…±åÍ¥Ì€¡™ÍE¤()Q¡”™ÍEÁÉ½Ù¥‘•Ì„€¨©½¹™¥ÕÉ…Ñ¥½¹…°½µÁ±•µ•¹Ğ¨¨Ñ¼Ñ¡”É•É•ÍÍ¥½¸…¹…±åÍ¥Ì¸)]¡¥±”A½¥ÍÍ½¸É•É•ÍÍ¥½¸•ÍÑ¥µ…Ñ•ÌÑ¡”€©…Ù•É…”µ…É¥¹…°•™™•Ğ¨½˜Ñ¡”%0)¥¹‘•à½¸±¥ÅÕ¥‘¥Ñä½Õ¹Ğ°™ÍE•áÁ±½É•Ìİ¡•Ñ¡•ÈÍÁ•¥™¥Œ€¨©½µ‰¥¹…Ñ¥½¹Ì½˜)½¹‘¥Ñ¥½¹Ì¨¨€¡°P°,¤…±¥¸İ¥Ñ ¡¥ É•…±¥é•±¥ÅÕ¥‘¥Ñä¸€Q¡”Ñİ¼…ÁÁÉ½…¡•Ì)½Á•É…Ñ”Õ¹‘•È™Õ¹‘…µ•¹Ñ…±±ä‘¥™™•É•¹Ğ±½¥Ìè()ğğI•É•ÍÍ¥½¸ğ™ÍEğ)ğ´´´´µğè´´´´´´´´´´µğè´´´´´µğ)ğEÕ•ÍÑ¥½¸ğ½•Ìµ½É”%0ÁÉ½‘Õ”µ½É”Í¥¹…±Ì€©½¸…Ù•É…”¨üğ%Ì
+İS
+İ,„É•±¥…‰±”€©É•¥Á”¨™½È¡¥ ±¥ÅÕ¥‘¥Ñäüğ)ğ1½¥ŒğMåµµ•ÑÉ¥Œ°¹•Ğµ•™™•ĞğÍåµµ•ÑÉ¥Œ°½¹™¥ÕÉ…Ñ¥½¹…°ğ)ğÅÕ¥™¥¹…±¥Ñäğ9½Ğµ½‘•±±•ğáÁ±¥¥Ñ±ä¥‘•¹Ñ¥™¥•ğ)ğ…ÕÍ…°…Íåµµ•ÑÉäğÍÍÕµ•Íåµµ•ÑÉ¥Œğù
+İùS
+İù,¹••¹½Ğ•áÁ±…¥¸ùdğ((ŒŒÕééä…±¥‰É…Ñ¥½¸()½¹Ñ¥¹Õ½ÕÌµ•…ÍÕÉ•Ì…É”ÑÉ…¹Í™½Éµ•¥¹Ñ¼™ÕééäµÍ•Ğµ•µ‰•ÉÍ¡¥ÀÍ½É•Ì€‘q¥¸lÀ°Åt)ÕÍ¥¹œ‘¥É•Ğ…±¥‰É…Ñ¥½¸İ¥Ñ Ñ¡É•”ÅÕ…±¥Ñ…Ñ¥Ù”…¹¡½ÉÌ€¡™Õ±±ä½ÕĞ°É½ÍÍ½Ù•È°)™Õ±±ä¥¸¤¸€]”½µÁ…É”Ñİ¼½Á•É…Ñ¥½¹…±¥Í…Ñ¥½¹Ì½˜Í•µ…¹Ñ¥Œ±…É¥Ñäè((´€¨©ù½±‘ø¨¨èÑ¡”‰¥¹…Éä91@ÁÉ•‘¥Ñ¥½¸€¡Í•µ…¹Ñ¥}ÁÉ•‘€ƒŠ" ìÀ°€Åô¤°ÕÍ•…ÌÉ¥ÍÀÍ•Ğ¸(´€¨©ù¹•İø¨¨èÑ¡”½¹Ñ¥¹Õ½ÕÌ±…ÍÍ¥™¥•ÈÍ½É”€¡Í•µ…¹Ñ¥}Í½É•€ƒŠ" lÀ¸ÈÔ°€À¸Üİt¤°…±¥‰É…Ñ•…Ì™ÕééäÍ•Ğ¸()íÈ™ÍÅ„µ…±¥‰É…Ñ¥½¹ô(Œ…±¥‰É…Ñ”)‘˜‘™Í}}½±€ğ´…Ì¹¹Õµ•É¥Œ¡‘˜‘}Í•µ…¹Ñ¥Œ¤€€ŒÉ¥ÍÀ€À¼Ä((Œ}¹•Üè½¹Ñ¥¹Õ½ÕÌÍ½É”¸€¹¡½ÉÌ¡½Í•¸™É½´‘¥ÍÑÉ¥‰ÕÑ¥½¸è(Œ€€™Õ±±äµ½ÕĞ€ô€À¸ÌÀ€¡øÕÑ ÁĞ¤°É½ÍÍ½Ù•È€ô€À¸ÔÈ€¡Ñ¡É•Í¡½±¤°™Õ±±äµ¥¸€ô€À¸ÜÌ€¡øäÕÑ ÁĞ¤)‘˜‘™Í}}¹•Ü€ğ´…±¥‰É…Ñ”¡‘˜‘}Í½É”°ÑåÁ”€ô€‰™Õééäˆ°Ñ¡É•Í¡½±‘Ì€ôŒ À¸ÌÀ°€À¸ÔÈ°€À¸ÜÌ¤¤)‘˜‘™Í}P€€€€€ğ´…±¥‰É…Ñ”¡‘˜‘Q}É…¹¬°€ÑåÁ”€ô€‰™Õééäˆ°Ñ¡É•Í¡½±‘Ì€ôŒ À°€Ğ°€ä¤¤)‘˜‘™Í},€€€€€ğ´…±¥‰É…Ñ”¡‘˜‘­}¡…É‘}­•å}½Õ¹Ğ°ÑåÁ”€ô€‰™Õééäˆ°Ñ¡É•Í¡½±‘Ì€ôŒ À°€Ä°€Ô¤¤)‘˜‘™Í}=UP€€€ğ´…±¥‰É…Ñ”¡‘˜‘±¥ÅÕ¥‘¥Ñå}½Õ¹Ğ°€ÑåÁ”€ô€‰™Õééäˆ°Ñ¡É•Í¡½±‘Ì€ôŒ À°€È°€Ğ¤¤((ŒMÑ…¹‘…É¹Õ‘”è€À¸ÔƒŠH€À¸ÔÀÄÑ¼É•Í½±Ù”É½ÍÍ½Ù•È…µ‰¥Õ¥Ñä)¹Õ‘”€ğ´™Õ¹Ñ¥½¸¡à¤¥™•±Í”¡à€ôô€À¸Ô°à€¬€À¸ÀÀÄ°à¤)‘˜‘™Í}}¹•Ü€ğ´¹Õ‘”¡‘˜‘™Í}}¹•Ü¤)‘˜‘™Í}P€€€€€ğ´¹Õ‘”¡‘˜‘™Í}P¤)‘˜‘™Í},€€€€€ğ´¹Õ‘”¡‘˜‘™Í},¤)‘˜‘™Í}=UP€€€ğ´¹Õ‘”¡‘˜‘™Í}=UP¤()…±}Ñ‰°€ğ´Ñ¥‰‰±” (€M•Ğ€ôŒ ‰€¡91@ÁÉ•‘¥Ñ¥½¸°É¥ÍÀ¤ˆ°€‰€¡±…ÍÍ¥™¥•ÈÍ½É”°™Õééä¤ˆ°(€€€€€€€€€€‰P€¡Ñ•µÁ½É…°¤ˆ°€‰,€¡½µÁ½Í…‰¥±¥Ñä¤ˆ°€‰d€¡±¥ÅÕ¥‘¥Ñä¤ˆ¤°(€I…Üµ•…ÍÕÉ•€€ôŒ ‰Í•µ…¹Ñ¥}ÁÉ•ìÀ°Åôˆ°€‰Í•µ…¹Ñ¥}Í½É”lÀ¸È×ŠLÀ¸Üİtˆ°(€€€€€€€€€€€€€€€€€€€€€‰Q}É…¹¬€ ÃŠLä¤ˆ°€‰¡…É‘}­•å}½Õ¹Ğˆ°€‰±¥ÅÕ¥‘¥Ñå}½Õ¹Ğ€ ÃŠLĞ¤ˆ¤°(€Õ±±ä½ÕÑ€€ôŒ À°€À¸ÌÀ°€À°€À°€À¤°(€É½ÍÍ½Ù•È€€€ôŒ ‰9ˆ°€À¸ÔÈ°€Ğ°€Ä°€È¤°(€Õ±±ä¥¹€€€ôŒ Ä°€À¸ÜÌ°€ä°€Ô°€Ğ¤°(€5•…¸™Í€€€€ôŒ¡µ•…¸¡‘˜‘™Í}}½±¤°µ•…¸¡‘˜‘™Í}}¹•Ü¤°µ•…¸¡‘˜‘™Í}P¤°(€€€€€€€€€€€€€€€€€µ•…¸¡‘˜‘™Í},¤°µ•…¸¡‘˜‘™Í}=UP¤¤(¤()­‰°¡…±}Ñ‰°°‘¥¥ÑÌ€ô€Ì°(€€€…ÁÑ¥½¸€ô€‰Q…‰±”€ØèÕééäµM•Ğ…±¥‰É…Ñ¥½¸¹¡½ÉÌ…¹MÕµµ…Éäˆ¤€”ø”(€­…‰±•}ÍÑå±¥¹œ¡‰½½ÑÍÑÉ…Á}½ÁÑ¥½¹Ì€ôŒ ‰ÍÑÉ¥Á•ˆ°€‰½¹‘•¹Í•ˆ¤°™Õ±±}İ¥‘Ñ €ô1M¤€”ø”(€™½½Ñ¹½Ñ”¡•¹•É…°€ô€‰¥É•Ğ…±¥‰É…Ñ¥½¸ÕÍ¥¹œEèé…±¥‰É…Ñ” ¤¸}¹•Ü…¹¡½ÉÌè€ÕÑ Á•É•¹Ñ¥±”€¡™Õ±±ä½ÕĞ¤°±…ÍÍ¥™¥•ÈÑ¡É•Í¡½±€¡É½ÍÍ½Ù•È¤°€äÕÑ Á•É•¹Ñ¥±”€¡™Õ±±ä¥¸¤¸…Í•Ì…Ğ€À¸Ô¹Õ‘•€¬À¸ÀÀÄ¸ˆ¤)€((ŒŒ9••ÍÍ¥Ñä¹…±åÍ¥Ì()½¹‘¥Ñ¥½¸¥Ì€¨©¹••ÍÍ…Éä¨¨™½È…¸½ÕÑ½µ”¥˜¥ÑÌ½¹Í¥ÍÑ•¹äÍ½É”ƒŠ&”€À¸äÀ¸()íÈ™ÍÅ„µ¹••ÍÍ¥Ñåô)Å…}½±€ğ´‘…Ñ„¹™É…µ”¡€ô‘˜‘™Í}}½±°P€ô‘˜‘™Í}P°,€ô‘˜‘™Í},°=UP€ô‘˜‘™Í}=UP¤)Å…}¹•Ü€ğ´‘…Ñ„¹™É…µ”¡€ô‘˜‘™Í}}¹•Ü°P€ô‘˜‘™Í}P°,€ô‘˜‘™Í},°=UP€ô‘˜‘™Í}=UP¤((ŒáÑ•¹‘•¹••ÍÍ¥ÑäÑ•ÉµÌ)‰Õ¥±‘}¹•Œ€ğ´™Õ¹Ñ¥½¸¡™Í}Œ°™Í}Ğ°™Í}¬°™Í}½ÕĞ¤ì(€¹•}‘˜€ğ´‘…Ñ„¹™É…µ” (€€€€€€€€€ô™Í}Œ°(€€€ù€€€€ô€Ä€´™Í}Œ°(€€€P€€€€€€ô™Í}Ğ°(€€€ùQ€€€€ô€Ä€´™Í}Ğ°(€€€,€€€€€€ô™Í}¬°(€€€ù-€€€€ô€Ä€´™Í}¬°(€€€­Q€€€ôÁµ…à¡™Í}Œ°™Í}Ğ¤°(€€€­-€€€ôÁµ…à¡™Í}Œ°™Í}¬¤°(€€€P­-€€€ôÁµ…à¡™Í}Ğ°™Í}¬¤°(€€€­P­-€ôÁµ…à¡™Í}Œ°™Í}Ğ°™Í}¬¤°(€€€=UP€€€€ô™Í}½ÕĞ°(€€€¡•¬¹¹…µ•Ì€ô1M(€€¤(€É•Ì€ğ´Á½˜¡Í•ÑµÌ€ô¹•}‘™l°€ÄèÄÁt°½ÕÑ½µ”€ô€‰=UPˆ°‘…Ñ„€ô¹•}‘˜°É•±…Ñ¥½¸€ô€‰¹••ÍÍ¥Ñäˆ¤(€½ÕĞ€ğ´É•Ì‘¥¹°¹½Ø(€Ñ¥‰‰±” (€€€áÁÉ•ÍÍ¥½¸€€ôÉ½İ¹…µ•Ì¡½ÕĞ¤°(€€€½¹Í¥ÍÑ•¹ä€ô½ÕÑl°€‰¥¹±8‰t°(€€€½Ù•É…”€€€€ô½ÕÑl°€‰½Ù8‰t(€€¤)ô()¹•}½±€ğ´‰Õ¥±‘}¹•Œ¡‘˜‘™Í}}½±°‘˜‘™Í}P°‘˜‘™Í},°‘˜‘™Í}=UP¤€”ø”µÕÑ…Ñ”¡5½‘•°€ô€‰}½±ˆ¤)¹•}¹•Ü€ğ´‰Õ¥±‘}¹•Œ¡‘˜‘™Í}}¹•Ü°‘˜‘™Í}P°‘˜‘™Í},°‘˜‘™Í}=UP¤€”ø”µÕÑ…Ñ”¡5½‘•°€ô€‰}¹•Üˆ¤)¹•}µÀ€ğ´‰¥¹‘}É½İÌ¡¹•}½±°¹•}¹•Ü¤€”ø”(€Á¥Ù½Ñ}İ¥‘•È¡¹…µ•Í}™É½´€ô5½‘•°°(€€€€€€€€€€€€€Ù…±Õ•Í}™É½´€ôŒ¡½¹Í¥ÍÑ•¹ä°½Ù•É…”¤°(€€€€€€€€€€€€€¹…µ•Í}Í•À€ô€ˆ€ˆ¤()­‰°¡¹•}µÀ°‘¥¥ÑÌ€ô€Ğ°(€€€…ÁÑ¥½¸€ô€‰Q…‰±”€Üè9••ÍÍ¥Ñä¹…±åÍ¥Ìè}½±ÙÌ}¹•Üˆ¤€”ø”(€­…‰±•}ÍÑå±¥¹œ¡‰½½ÑÍÑÉ…Á}½ÁÑ¥½¹Ì€ôŒ ‰ÍÑÉ¥Á•ˆ°€‰½¹‘•¹Í•ˆ¤°™Õ±±}İ¥‘Ñ €ô1M°(€€€€€€€€€€€€€€€™½¹Ñ}Í¥é”€ô€ÄÄ¤€”ø”(€™½½Ñ¹½Ñ”¡•¹•É…°€ô€ˆœ¬œ€ô±½¥…°=H€¡‘¥Í©Õ¹Ñ¥½¸¤°€øœ€ô¹•…Ñ¥½¸¸M½É•ÌƒŠ&”€À¸äÀ‰½±‘•¸ˆ¤)€()íÈ™¥œµ¹••ÍÍ¥Ñä°™¥œ¹…Àô‰¥ÕÉ”€Ìè9••ÍÍ¥Ñä½¹Í¥ÍÑ•¹äè}½±ÙÌ}¹•Ü‰ô)¹•}Á±½Ğ€ğ´‰¥¹‘}É½İÌ (€¹•}½±€”ø”™¥±Ñ•È¡áÁÉ•ÍÍ¥½¸€•¥¸”Œ ‰ˆ°€‰Pˆ°€‰,ˆ°€‰­Pˆ°€‰­,ˆ°€‰P­,ˆ°€‰­P­,ˆ¤¤°(€¹•}¹•Ü€”ø”™¥±Ñ•È¡áÁÉ•ÍÍ¥½¸€•¥¸”Œ ‰ˆ°€‰Pˆ°€‰,ˆ°€‰­Pˆ°€‰­,ˆ°€‰P­,ˆ°€‰­P­,ˆ¤¤(¤()Á±½Ğ¡¹•}Á±½Ğ°…•Ì¡à€ôÉ•½É‘•È¡áÁÉ•ÍÍ¥½¸°½¹Í¥ÍÑ•¹ä¤°ä€ô½¹Í¥ÍÑ•¹ä°(€€€€€€€€€€€€€€€€€€€€™¥±°€ô5½‘•°¤¤€¬(€•½µ}½°¡Á½Í¥Ñ¥½¸€ôÁ½Í¥Ñ¥½¹}‘½‘”¡İ¥‘Ñ €ô€À¸Ü¤°İ¥‘Ñ €ô€À¸Ø¤€¬(€•½µ}¡±¥¹”¡å¥¹Ñ•É•ÁĞ€ô€À¸äÀ°±¥¹•ÑåÁ”€ô€‰‘…Í¡•ˆ°½±½È€ô€‰É•ˆ°±¥¹•İ¥‘Ñ €ô€À¸Ô¤€¬(€…¹¹½Ñ…Ñ” ‰Ñ•áĞˆ°à€ô€À¸Ø°ä€ô€À¸äÄÔ°±…‰•°€ô€ˆÀ¸äÀÑ¡É•Í¡½±ˆ°½±½È€ô€‰É•ˆ°(€€€€€€€€€€¡©ÕÍĞ€ô€À°Í¥é”€ô€Ì¤€¬(€½½É‘}™±¥À ¤€¬(€Í…±•}™¥±±}µ…¹Õ…°¡Ù…±Õ•Ì€ôŒ ‰}½±ˆ€ô€ˆŒÜÔÜÁˆÌˆ°€‰}¹•Üˆ€ô€ˆŒÅˆå”ÜÜˆ¤°(€€€€€€€€€€€€€€€€€€€±…‰•±Ì€ôŒ ‰}½±ˆ€ô€‰91@ÁÉ•‘¥Ñ¥½¸€¡É¥ÍÀ¤ˆ°€‰}¹•Üˆ€ô€‰±…ÍÍ¥™¥•ÈÍ½É”€¡™Õééä¤ˆ¤¤€¬(€Í…±•}å}½¹Ñ¥¹Õ½ÕÌ¡±¥µ¥ÑÌ€ôŒ À°€Ä¤°‰É•…­Ì€ôÍ•Ä À°€Ä°€À¸Ä¤¤€¬(€±…‰Ì¡à€ô9U10°ä€ô€‰9••ÍÍ¥Ñä½¹Í¥ÍÑ•¹äˆ°™¥±°€ô€‰±…É¥Ñäµ•…ÍÕÉ”ˆ¤€¬(€Ñ¡•µ”¡±••¹¹Á½Í¥Ñ¥½¸€ô€‰‰½ÑÑ½´ˆ¤)€()]¥Ñ Ñ¡”½¹Ñ¥¹Õ½ÕÌ±…ÍÍ¥™¥•ÈÍ½É”°€‘qÕÀPÉ½ÍÍ•ÌÑ¡”¹••ÍÍ¥Ñä)Ñ¡É•Í¡½±€¡½¹Í¥ÍÑ•¹ä€ô€¨©ÈÍÁÉ¥¹Ñ˜ ˆ”¸Í˜ˆ°¹•}¹•Ü‘½¹Í¥ÍÑ•¹åm¹•}¹•Ü‘áÁÉ•ÍÍ¥½¸€ôô€‰­P‰t¥€¨¨¤°)İ¡¥±”¹•¥Ñ¡•È½¹‘¥Ñ¥½¸…±½¹”¥Ì¥¹‘¥Ù¥‘Õ…±±ä¹••ÍÍ…Éä¸((ŒŒQÉÕÑ Q…‰±•Ì()íÈ™ÍÅ„µÑÉÕÑ¡Ñ…‰±•Íô)ÑÑ}½±€ğ´ÑÉÕÑ¡Q…‰±”¡Å…}½±°½ÕÑ½µ”€ô€‰=UPˆ°½¹‘¥Ñ¥½¹Ì€ôŒ ‰ˆ°€‰Pˆ°€‰,ˆ¤°(€€€€€€€€€€€€€€€€€€€€¥¹°¹ÕĞ€ô€À¸àÀ°¸¹ÕĞ€ô€ÌÀ°(€€€€€€€€€€€€€€€€€€€€Í½ÉĞ¹‰ä€ôŒ ‰¥¹°ˆ°€‰¸ˆ¤°½µÁ±•Ñ”€ô1M¤()ÑÑ}¹•Ü€ğ´ÑÉÕÑ¡Q…‰±”¡Å…}¹•Ü°½ÕÑ½µ”€ô€‰=UPˆ°½¹‘¥Ñ¥½¹Ì€ôŒ ‰ˆ°€‰Pˆ°€‰,ˆ¤°(€€€€€€€€€€€€€€€€€€€€¥¹°¹ÕĞ€ô€À¸àÀ°¸¹ÕĞ€ô€ÌÀ°(€€€€€€€€€€€€€€€€€€€€Í½ÉĞ¹‰ä€ôŒ ‰¥¹°ˆ°€‰¸ˆ¤°½µÁ±•Ñ”€ô1M¤()™½Éµ…Ñ}ÑĞ€ğ´™Õ¹Ñ¥½¸¡ÑĞ°±…‰•°¤ì(€€ğ´ÑĞ‘ÑĞ(€€”ø”(€€€µÕÑ…Ñ” (€€€€€¥¹°€ô¥™•±Í”¡¥Ì¹¹„¡¥¹°¤°€‰9ˆ°ÍÁÉ¥¹Ñ˜ ˆ”¸Ñ˜ˆ°…Ì¹¹Õµ•É¥Œ¡¥¹°¤¤¤°(€€€€€AI$€€ô¥™•±Í”¡¥Ì¹¹„¡AI$¤°€€‰9ˆ°ÍÁÉ¥¹Ñ˜ ˆ”¸Ñ˜ˆ°…Ì¹¹Õµ•É¥Œ¡AI$¤¤¤(€€€€¤€”ø”(€€€Í•±•Ğ¡°P°,°¸°¥¹°°AI$°=UP¤€”ø”(€€€µÕÑ…Ñ”¡5½‘•°€ô±…‰•°¤)ô()ÑÑ}‰½Ñ €ğ´‰¥¹‘}É½İÌ (€™½Éµ…Ñ}ÑĞ¡ÑÑ}½±°€‰}½±€¡91@ÁÉ•‘¥Ñ¥½¸¤ˆ¤°(€™½Éµ…Ñ}ÑĞ¡ÑÑ}¹•Ü°€‰}¹•Ü€¡±…ÍÍ¥™¥•ÈÍ½É”¤ˆ¤(¤()­‰°¡ÑÑ}‰½Ñ €”ø”Í•±•Ğ µ5½‘•°¤°(€€€½°¹¹…µ•Ì€ôŒ ‰ˆ°€‰Pˆ°€‰,ˆ°€‰8ˆ°€‰%¹°¸ˆ°€‰AI$ˆ°€‰=UPˆ¤°(€€€…ÁÑ¥½¸€ô€‰Q…‰±”€àè™ÍEQÉÕÑ Q…‰±•Ì€¡¥¹±ÕÍ¥½¸ÕĞ€ô€À¸àÀ°8ÕĞ€ô€ÌÀ¤ˆ¤€”ø”(€­…‰±•}ÍÑå±¥¹œ¡‰½½ÑÍÑÉ…Á}½ÁÑ¥½¹Ì€ôŒ ‰ÍÑÉ¥Á•ˆ°€‰½¹‘•¹Í•ˆ¤°™Õ±±}İ¥‘Ñ €ô1M¤€”ø”(€Á…­}É½İÌ ‰A…¹•°è}½±€¡91@ÁÉ•‘¥Ñ¥½¸¤ˆ°€Ä°¹É½Ü¡™½Éµ…Ñ}ÑĞ¡ÑÑ}½±°€ˆˆ¤¤¤€”ø”(€Á…­}É½İÌ ‰A…¹•°è}¹•Ü€¡±…ÍÍ¥™¥•ÈÍ½É”¤ˆ°(€€€€€€€€€€€¹É½Ü¡™½Éµ…Ñ}ÑĞ¡ÑÑ}½±°€ˆˆ¤¤€¬€Ä°¹É½Ü¡ÑÑ}‰½Ñ ¤¤)€((ŒŒMÕ™™¥¥•¹Ğ½¹™¥ÕÉ…Ñ¥½¹Ì()íÈ™ÍÅ„µµ¥¹¥µ¥Í…Ñ¥½¹ô)Í½±}½±€ğ´ÑÉå…Ñ ¡µ¥¹¥µ¥é”¡ÑÑ}½±°‘•Ñ…¥±Ì€ôQIU¤°•ÉÉ½È€ô™Õ¹Ñ¥½¸¡”¤9U10¤)Í½±}¹•Ü€ğ´ÑÉå…Ñ ¡µ¥¹¥µ¥é”¡ÑÑ}¹•Ü°‘•Ñ…¥±Ì€ôQIU¤°•ÉÉ½È€ô™Õ¹Ñ¥½¸¡”¤9U10¤()™½Éµ…Ñ}Í½°€ğ´™Õ¹Ñ¥½¸¡Í½°¤ì(€¥˜€¡¥Ì¹¹Õ±°¡Í½°¤¤É•ÑÕÉ¸ ‰9¼ÍÕ™™¥¥•¹Ğ½¹™¥ÕÉ…Ñ¥½¹Ì™½Õ¹¸ˆ¤(€Á…ÍÑ”¡…ÁÑÕÉ”¹½ÕÑÁÕĞ¡ÁÉ¥¹Ğ¡Í½°¤¤°½±±…ÁÍ”€ô€‰q¸ˆ¤)ô)€((ŒŒŒA…¹•°èù½±‘ø€¡91@ÁÉ•‘¥Ñ¥½¸¤()íÈÍ½°µ½±°É•ÍÕ±ÑÌô…Í¥Ìô)…Ğ ‰q¸ˆ¤)…Ğ¡™½Éµ…Ñ}Í½°¡Í½±}½±¤¤)…Ğ ‰q¹q¸ˆ¤)€((ŒŒŒA…¹•°èù¹•İø€¡±…ÍÍ¥™¥•ÈÍ½É”¤()íÈÍ½°µ¹•Ü°É•ÍÕ±ÑÌô…Í¥Ìô)…Ğ ‰q¸ˆ¤)…Ğ¡™½Éµ…Ñ}Í½°¡Í½±}¹•Ü¤¤)…Ğ ‰q¹q¸ˆ¤)€((ŒŒMÕ™™¥¥•¹ä½¹Í¥ÍÑ•¹ä½µÁ…É¥Í½¸()íÈÑ‰°µÍÕ™˜µ½µÁ…É•ô)½¹™¥Ì€ğ´±¥ÍĞ (€€‰
+İS
+İ,ˆ€ô™Õ¹Ñ¥½¸¡°}½°¤Áµ¥¸¡‘mm}½±ut°‘™Í}P°‘™Í},¤°(€€‰
+İPˆ€€€ô™Õ¹Ñ¥½¸¡°}½°¤Áµ¥¸¡‘mm}½±ut°‘™Í}P¤°(€€‰
+İ,ˆ€€€ô™Õ¹Ñ¥½¸¡°}½°¤Áµ¥¸¡‘mm}½±ut°‘™Í},¤°(€€‰S
+İ,ˆ€€€ô™Õ¹Ñ¥½¸¡°}½°¤Áµ¥¸¡‘™Í}P°‘™Í},¤°(€€‰ˆ€€€€€ô™Õ¹Ñ¥½¸¡°}½°¤‘mm}½±ut°(€€‰Pˆ€€€€€ô™Õ¹Ñ¥½¸¡°}½°¤‘™Í}P°(€€‰,ˆ€€€€€ô™Õ¹Ñ¥½¸¡°}½°¤‘™Í},(¤()ÍÕ™™}É½İÌ€ğ´±…ÁÁ±ä¡¹…µ•Ì¡½¹™¥Ì¤°™Õ¹Ñ¥½¸¡™}¹…µ”¤ì(€™¸€ğ´½¹™¥Ímm™}¹…µ•ut((€Í}½±€ğ´™¸¡‘˜°€‰™Í}}½±ˆ¤(€½¹Í}½±€ğ´ÍÕ´¡Áµ¥¸¡Í}½±°‘˜‘™Í}=UP¤¤€¼ÍÕ´¡Í}½±¤(€½Ù}½±€€ğ´ÍÕ´¡Áµ¥¸¡Í}½±°‘˜‘™Í}=UP¤¤€¼ÍÕ´¡‘˜‘™Í}=UP¤((€Í}¹•Ü€ğ´™¸¡‘˜°€‰™Í}}¹•Üˆ¤(€½¹Í}¹•Ü€ğ´ÍÕ´¡Áµ¥¸¡Í}¹•Ü°‘˜‘™Í}=UP¤¤€¼ÍÕ´¡Í}¹•Ü¤(€½Ù}¹•Ü€€ğ´ÍÕ´¡Áµ¥¸¡Í}¹•Ü°‘˜‘™Í}=UP¤¤€¼ÍÕ´¡‘˜‘™Í}=UP¤((€Ñ¥‰‰±”¡½¹™¥ÕÉ…Ñ¥½¸€ô™}¹…µ”°(€€€€€€€€½¹Ì€¡}½±¥€€ô½¹Í}½±°½Ø€¡}½±¥€€ô½Ù}½±°(€€€€€€€€½¹Ì€¡}¹•Ü¥€€ô½¹Í}¹•Ü°½Ø€¡}¹•Ü¥€€ô½Ù}¹•Ü°(€€€€€€€€ƒ:P½¹Í€€ô½¹Í}¹•Ü€´½¹Í}½±¤)ô¤)ÍÕ™™}Ñ‰°€ğ´‰¥¹‘}É½İÌ¡ÍÕ™™}É½İÌ¤()­‰°¡ÍÕ™™}Ñ‰°°‘¥¥ÑÌ€ô€Ğ°(€€€…ÁÑ¥½¸€ô€‰Q…‰±”€äèMÕ™™¥¥•¹ä½¹Í¥ÍÑ•¹ä€˜½Ù•É…”è}½±ÙÌ}¹•Üˆ¤€”ø”(€­…‰±•}ÍÑå±¥¹œ¡‰½½ÑÍÑÉ…Á}½ÁÑ¥½¹Ì€ôŒ ‰ÍÑÉ¥Á•ˆ°€‰½¹‘•¹Í•ˆ¤°™Õ±±}İ¥‘Ñ €ô1M¤)€()íÈ™¥œµÍÕ™˜µ½µÁ…É”°™¥œ¹…Àô‰¥ÕÉ”€ĞèMÕ™™¥¥•¹ä½¹Í¥ÍÑ•¹ä‰ä½¹™¥ÕÉ…Ñ¥½¸€¡}½±ÙÌ}¹•Ü¤‰ô)ÍÕ™™}±½¹œ€ğ´ÍÕ™™}Ñ‰°€”ø”(€Í•±•Ğ¡½¹™¥ÕÉ…Ñ¥½¸°½¹Ì€¡}½±¥€°½¹Ì€¡}¹•Ü¥€¤€”ø”(€Á¥Ù½Ñ}±½¹•È µ½¹™¥ÕÉ…Ñ¥½¸°¹…µ•Í}Ñ¼€ô€‰5½‘•°ˆ°Ù…±Õ•Í}Ñ¼€ô€‰½¹Í¥ÍÑ•¹äˆ¤€”ø”(€µÕÑ…Ñ”¡5½‘•°€ô¥™•±Í”¡5½‘•°€ôô€‰½¹Ì€¡}½±¤ˆ°€‰}½±ˆ°€‰}¹•Üˆ¤¤()Á±½Ğ¡ÍÕ™™}±½¹œ°…•Ì¡à€ôÉ•½É‘•È¡½¹™¥ÕÉ…Ñ¥½¸°½¹Í¥ÍÑ•¹ä¤°(€€€€€€€€€€€€€€€€€€€€€ä€ô½¹Í¥ÍÑ•¹ä°™¥±°€ô5½‘•°¤¤€¬(€•½µ}½°¡Á½Í¥Ñ¥½¸€ôÁ½Í¥Ñ¥½¹}‘½‘”¡İ¥‘Ñ €ô€À¸Ü¤°İ¥‘Ñ €ô€À¸Ø¤€¬(€•½µ}¡±¥¹”¡å¥¹Ñ•É•ÁĞ€ô€À¸àÀ°±¥¹•ÑåÁ”€ô€‰‘…Í¡•ˆ°½±½È€ô€‰É•ˆ°±¥¹•İ¥‘Ñ €ô€À¸Ô¤€¬(€…¹¹½Ñ…Ñ” ‰Ñ•áĞˆ°à€ô€À¸Ø°ä€ô€À¸àÄÔ°±…‰•°€ô€ˆÀ¸àÀÑ¡É•Í¡½±ˆ°½±½È€ô€‰É•ˆ°(€€€€€€€€€€¡©ÕÍĞ€ô€À°Í¥é”€ô€Ì¤€¬(€½½É‘}™±¥À ¤€¬(€Í…±•}™¥±±}µ…¹Õ…°¡Ù…±Õ•Ì€ôŒ ‰}½±ˆ€ô€ˆŒÜÔÜÁˆÌˆ°€‰}¹•Üˆ€ô€ˆŒÅˆå”ÜÜˆ¤°(€€€€€€€€€€€€€€€€€€€±…‰•±Ì€ôŒ ‰}½±ˆ€ô€‰91@ÁÉ•‘¥Ñ¥½¸€¡É¥ÍÀ¤ˆ°€‰}¹•Üˆ€ô€‰±…ÍÍ¥™¥•ÈÍ½É”€¡™Õééä¤ˆ¤¤€¬(€Í…±•}å}½¹Ñ¥¹Õ½ÕÌ¡±¥µ¥ÑÌ€ôŒ À°€Ä¤°‰É•…­Ì€ôÍ•Ä À°€Ä°€À¸Ä¤¤€¬(€±…‰Ì¡à€ô9U10°ä€ô€‰MÕ™™¥¥•¹ä½¹Í¥ÍÑ•¹äˆ°™¥±°€ô€‰±…É¥Ñäµ•…ÍÕÉ”ˆ¤€¬(€Ñ¡•µ”¡±••¹¹Á½Í¥Ñ¥½¸€ô€‰‰½ÑÑ½´ˆ¤)€((ŒMÕµµ…Éä½˜¥¹‘¥¹Ì()íÈÑ‰°µÍå¹Ñ¡•Í¥Íô)Íå¹Ñ €ğ´Ñ¥‰‰±” (€Ù¥‘•¹”€ôŒ (€€€€‰5…¥¸A½¥ÍÍ½¸€¡%0ƒŠHd¤ˆ°(€€€€‰=1Lˆ°(€€€€‰=É‘•É•±½¥Ğˆ°(€€€€‰AÉ½Ù¥‘•ÈA½¥ÍÍ½¸ˆ°(€€€€‰1•…ä‰¥¹…Éä)}¤ˆ°(€€€€‰EÕ¥¹Ñ¥±”DÔÙÌDÄˆ°(€€€€‰™ÍE
+İS
+İ,€¡}¹•Ü¤ˆ(€€¤°(€™™•ĞM¥é•€€ôŒ (€€€ÍÁÉ¥¹Ñ˜ ‰%IH€ô€”¸Í˜ˆ°¥ÉÈ¤°(€€€ÍÁÉ¥¹Ñ˜ ‹:È€ô€”¸Í˜ˆ°½±Í}ˆ¤°(€€€ÍÁÉ¥¹Ñ˜ ‰=H€ô€”¸Í˜ˆ°•áÀ¡½±½¥Ñ}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ‰%IH€ô€”¸Í˜ˆ°•áÀ¡Á™•}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ‰%IH€ô€”¸Í˜ˆ°•áÀ¡©¥}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ‰%IH€ô€”¸Í˜ˆ°•áÀ¡ÄÕ}ˆ¤¤°(€€€ÍÁÉ¥¹Ñ˜ ‰½¹Ì¸€ô€”¸Í˜ˆ°ÍÕ™™}Ñ‰°‘½¹Ì€¡}¹•Ü¥mÍÕ™™}Ñ‰°‘½¹™¥ÕÉ…Ñ¥½¸€ôô€‰
+İS
+İ,‰t¤(€€¤°(€M¥¹¥™¥…¹Ğ€ôŒ (€€€€‰e•Ì€¡À€ğ€¸ÀÀÄ¤ˆ°€‰e•Ì€¡À€ğ€¸ÀÀÄ¤ˆ°€‰e•Ì€¡À€ğ€¸ÀÀÄ¤ˆ°(€€€¥™•±Í”¡Á™•}À€ğ€À¸ÀÔ°€‰e•Ìˆ°€‰9¼ˆ¤°(€€€¥™•±Í”¡©¥}À€ğ€À¸ÀÔ°€‰e•Ìˆ°€‰9¼ˆ¤°(€€€¥™•±Í”¡ÄÕ}À€ğ€À¸ÀÔ°€‰e•Ìˆ°€‰9¼ˆ¤°(€€€¥™•±Í”¡ÍÕ™™}Ñ‰°‘½¹Ì€¡}¹•Ü¥mÍÕ™™}Ñ‰°‘½¹™¥ÕÉ…Ñ¥½¸€ôô€‰
+İS
+İ,‰t€øô€À¸ÜÔ°(€€€€€€€€€€€‰‰½Ù”€À¸ÜÔÕĞˆ°€‰	•±½Ü€À¸ÜÔÕĞˆ¤(€€¤°(€5•Ñ¡½‘€€ôŒ ‰A½¥ÍÍ½¸A50ˆ°€‰=1Lˆ°€‰=É‘•É•1½¥Ğˆ°€‰A½¥ÍÍ½¸€¬ˆ°(€€€€€€€€€€€€€€€‰A½¥ÍÍ½¸A50ˆ°€‰A½¥ÍÍ½¸A50ˆ°€‰™ÍE€¡Í•ĞµÑ¡•½É•Ñ¥Œ¤ˆ¤(¤()­‰°¡Íå¹Ñ °(€€€…ÁÑ¥½¸€ô€‰Q…‰±”€ÄÀè½¹Ù•É•¹ĞÙ¥‘•¹”è±°ÁÁÉ½…¡•ÌA½¥¹Ğ¥¸Ñ¡”M…µ”¥É•Ñ¥½¸ˆ¤€”ø”(€­…‰±•}ÍÑå±¥¹œ¡‰½½ÑÍÑÉ…Á}½ÁÑ¥½¹Ì€ôŒ ‰ÍÑÉ¥Á•ˆ°€‰½¹‘•¹Í•ˆ¤°™Õ±±}İ¥‘Ñ €ô1M¤)€((ŒŒ5•Ñ¡½‘½±½¥…°I•½µµ•¹‘…Ñ¥½¸((¨©5…¥¸ÍÁ•¥™¥…Ñ¥½¸ƒŠHA½¥ÍÍ½¸É•É•ÍÍ¥½¸¨¨€¡Q…‰±”€Ì¤¸Q¡¥ÌÁÉ½Ù¥‘•Ì„±•…È°)Í¥¹±”•ÍÑ¥µ…Ñ”½˜Ñ¡”%3ŠM±¥ÅÕ¥‘¥ÑäÉ•±…Ñ¥½¹Í¡¥Àİ¥Ñ ÍÑ…¹‘…É¥¹™•É•¹Ñ¥…°)ÍÕÁÁ½ÉĞ€¡M°$°ÀµÙ…±Õ”¤°½¹ÑÉ½±Ì™½ÈÕÍ”µ…Í”½µÁ½Í¥Ñ¥½¸…¹ÁÉ½Ù¥‘•È)¡•Ñ•É½•¹•¥Ñä°…¹å¥•±‘Ì„‘¥É•Ñ±ä¥¹Ñ•ÉÁÉ•Ñ…‰±”•™™•ĞÍ¥é”€¡%IH¤¸((¨©I½‰ÕÍÑ¹•ÍÌƒŠH™ÍE¨¨€¡M•Ñ¥½¸€Ô¤¸Q¡”½¹™¥ÕÉ…Ñ¥½¹…°…¹…±åÍ¥Ì½µÁ±•µ•¹ÑÌ)Ñ¡”É•É•ÍÍ¥½¸‰ä€¡„¤½Á•É…Ñ¥¹œÕ¹‘•È„™Õ¹‘…µ•¹Ñ…±±ä‘¥™™•É•¹Ğ…¹…±åÑ¥…°±½¥Œ(¡Í•ĞµÑ¡•½É•Ñ¥ŒÉ…Ñ¡•ÈÑ¡…¸½ÉÉ•±…Ñ¥½¹…°¤°€¡ˆ¤É•Ù•…±¥¹œ•ÅÕ¥™¥¹…°Á…Ñ¡İ…åÌ°…¹(¡Œ¤‘•µ½¹ÍÑÉ…Ñ¥¹œÑ¡…ĞÕÍ¥¹œÑ¡”½¹Ñ¥¹Õ½ÕÌ±…ÍÍ¥™¥•ÈÍ½É”¥¹ÍÑ•…½˜Ñ¡”‰¥¹…Éä)ÁÉ•‘¥Ñ¥½¸•±¥µ¥¹…Ñ•ÌÑ¡”Ñ¡•½É•Ñ¥…±±ä¥¹½¹Í¥ÍÑ•¹ĞÍÕ‰ÍÑ¥ÑÕÑ¥½¸Á…ÑÑ•É¹ÌÑ¡…Ğ)ÁÉ•Ù¥½ÕÍ±ä…™™±¥Ñ•Ñ¡”EÉ•ÍÕ±ÑÌ¸((©	½Ñ …ÁÁÉ½…¡•Ì½¹Ù•É”è¨¡¥¡•È%0¥Ì…ÍÍ½¥…Ñ•İ¥Ñ µ½É”ÑÉ…¹Í…Ñ¥½¹…°µÉ•…‘¥¹•ÍÌ)Í¥¹…±Ì°İ¡•Ñ¡•È…ÍÍ•ÍÍ•…Ì…¸…Ù•É…”µ…É¥¹…°•™™•Ğ½È…Ì…¸•áÁ±½É…Ñ½Éä)½¹™¥ÕÉ…Ñ¥½¹…°Á…ÑÑ•É¸¸(

@@ -24,6 +24,9 @@ dir.create("outputs", showWarnings = FALSE)
 cat("\n=== Regression checks ===\n")
 source("extract_results.R")
 
+cat("\n=== Productization and missing-rating robustness checks ===\n")
+source("robustness_extra.R")
+
 cat("\n=== fsQCA checks ===\n")
 source("extract_fsqca.R")
 

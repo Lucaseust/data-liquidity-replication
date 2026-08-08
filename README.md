@@ -1,61 +1,74 @@
-# Intrinsic Data Liquidity Replication Materials
+# Replication Materials: Chapter 2 (Data Liquidity and Market)
 
-This repository contains the data and code needed to reproduce the empirical
-analysis for the paper on intrinsic data liquidity and realized liquidity in
-B2B data marketplaces.
+Empirical analysis code for Study 2: a cross-sectional analysis of 4,525
+marketplace listings from 407 identified Datarade providers.
 
-Paper link: to be added after publication.
+## Files
 
-## Contents
+| File | Purpose |
+|------|---------|
+| `ch2_empirical_report.Rmd` | **Main reproducible report.** Generates all tables and figures (descriptives, Poisson regressions, robustness checks, fsQCA). |
+| `datarade_helpers.R` | Helper functions for data extraction from JSONL listings (delivery parsing, cadence ranking, key counting, etc.). |
+| `extract_results.R` | Standalone script that prints regression results and diagnostics to the console. |
+| `extract_fsqca.R` | Standalone script that prints fsQCA calibration, necessity, sufficiency, and truth-table results. |
+| `robustness_extra.R` | Productization-intensity and missing-rating robustness checks reported in the chapter. |
 
-| Path | Purpose |
-| --- | --- |
-| `data/updated_datarade_data_scored_copy.jsonl` | Listing-level replication data used in the analysis. |
-| `ch2_empirical_report.Rmd` | Main reproducible report; generates tables, figures, regressions, and fsQCA outputs. |
-| `datarade_helpers.R` | Helper functions for parsing listing metadata and constructing measures. |
-| `extract_results.R` | Console script for the regression results and descriptive outputs. |
-| `extract_fsqca.R` | Console script for fsQCA outputs and cross-check regressions. |
-| `install_packages.R` | Installs required R packages from CRAN. |
-| `reproduce.R` | One-command reproduction script. |
-| `DATA_DICTIONARY.md` | Variable definitions and operationalization notes. |
+## Data
+
+The input file `data/updated_datarade_data_scored_copy.jsonl` contains one JSON
+object per line (~40 MB): scraped Datarade listing metadata augmented with
+LLM-based semantic-classification scores. The scripts first look for the file
+beside the scripts (the manuscript-workspace layout) and then under `data/`
+(the public-repository layout). See `DATA_AVAILABILITY.md` before redistributing
+the listing-level data.
 
 ## Reproduce
 
-Install R 4.3 or later. Then run:
+1.  Install R (≥ 4.3) and the following packages:
 
-```r
-source("install_packages.R")
-source("reproduce.R")
-```
+    ```r
+    install.packages(c("jsonlite", "dplyr", "tidyr", "stringr",
+                        "ggplot2", "scales", "QCA",
+                        "kableExtra", "MASS", "sandwich", "clubSandwich"))
+    ```
 
-From a terminal:
+2.  Confirm that the JSONL data file is available either in this directory or
+    under `data/`.
 
-```bash
-Rscript install_packages.R
-Rscript reproduce.R
-```
+3.  Knit the report:
 
-The main HTML report is written to `outputs/ch2_empirical_report.html`.
+    ```r
+    setwd("<path-to-this-folder>")
+    rmarkdown::render("ch2_empirical_report.Rmd")
+    ```
 
-## Expected Key Results
+    Or run the standalone scripts:
 
-The checked replication run uses 4,552 unique marketplace listings from 408
-providers and 503 retained use-case controls.
+    ```r
+    setwd("<path-to-this-folder>")
+    source("extract_results.R")
+    source("extract_fsqca.R")
+    ```
 
-| Result | Estimate |
-| --- | --- |
-| Main Poisson PML, IDL index | beta = 0.2486, IRR = 1.2822, 95% CI [1.2439, 1.3216], p < .001 |
-| OLS robustness | beta = 0.5016, p < .001 |
-| Ordered logit robustness | beta = 0.4815, OR = 1.6185, p < .001 |
-| Provider fixed-effects Poisson | beta = 0.0670, IRR = 1.0692, p < .001 |
-| fsQCA parsimonious solution | K + C*T -> OUT, consistency = 0.745, coverage = 0.692 |
+## Key Results (summary)
 
-## Software
+- **Main Poisson (provider-clustered):** DL (std.) β = 0.164, IRR = 1.179, 95% CI [1.114, 1.247], *p* < .001
+- **OLS (provider-clustered):** β = 0.358, *p* < .001
+- **Ordered Logit (provider-clustered):** β = 0.443, OR = 1.557, *p* = .002
+- **Provider FE Poisson (provider-clustered):** β = 0.112, IRR = 1.119, *p* < .001
+- **Provider FE CR2/Satterthwaite:** SE = 0.0267, df = 38.8, *p* < .001
+- **Use-case controls:** 62 tags appearing in at least 2% of the estimation sample; nearby thresholds yield IRRs from 1.138 to 1.231
+- **fsQCA parsimonious solution:** K + C·T → OUT (consistency = 0.745, coverage = 0.692)
 
-The analysis was last checked with R 4.5.2 on 2026-04-25. Required packages are
-listed in `install_packages.R`.
+## Use-case controls
 
-## Citation
-
-Please cite the paper once it is published. Repository citation metadata are
-provided in `CITATION.cff`.
+The marketplace use-case field is multilabel: one listing can carry several
+tags. `make_prevalent_use_case_controls()` trims whitespace, converts tags to
+lower case, removes empty values, and expands every retained tag into a binary
+listing-level indicator. The baseline retains tags observed on at least 2% of
+the 4,525-listing estimation sample (at least 91 listings). Exact duplicate
+indicator profiles are removed deterministically before estimation, without
+consulting either the data-liquidity index or the outcome. The resulting 62
+indicators enter jointly as nuisance controls for intended application. Tags
+below the threshold are not pooled into an `other` category. Sensitivity checks
+repeat the estimation at thresholds from 1% to 5% and without use-case controls.
